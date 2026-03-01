@@ -15,7 +15,7 @@ import functools
 import logging
 import csv
 import re
-from typing import Dict, List, Optional, Tuple, Any, Set, Union
+from typing import Dict, List, Optional, Tuple, Any, Set, Union, Iterator
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
@@ -64,6 +64,19 @@ COLORS = {
     'reset': '\033[0m'
 }
 
+@contextmanager
+def timeout(seconds: int):
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+    
+    original_handler = signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, original_handler)
+
 class Config:
     _instance = None
     _config = {}
@@ -93,6 +106,7 @@ class Config:
         'cache_rebuild_lock_timeout': 30,
         'fast_process_scan': True,
         'skip_kernel_threads': True,
+        'file_operation_timeout': 5,
     }
     
     def __new__(cls):
@@ -216,7 +230,7 @@ class Logger:
         if log_dir and not os.path.isdir(log_dir):
             os.makedirs(log_dir, exist_ok=True)
         
-        if not os.access(log_dir, os.W_OK):
+        if log_dir and not os.access(log_dir, os.W_OK):
             raise RuntimeError(f"Log directory not writable: {log_dir}")
         
         if self.file_handler:
@@ -250,15 +264,12 @@ class Logger:
 class Security:
     @staticmethod
     def validate_path(path: str) -> bool:
+        if '..' in path.split('/') or '//' in path:
+            return False
+        
         normalized = Security._normalize_path(path)
         
         if not normalized.startswith('/proc/'):
-            return False
-        
-        if path != normalized and ('..' in path or '//' in path):
-            return False
-        
-        if '/../' in normalized or '/./' in normalized:
             return False
         
         allowed_patterns = [
@@ -272,7 +283,14 @@ class Security:
         
         for pattern in allowed_patterns:
             if re.match(pattern, normalized):
-                return True
+                try:
+                    if os.path.islink(path):
+                        real_path = os.path.realpath(path)
+                        if not real_path.startswith('/proc/'):
+                            return False
+                    return True
+                except OSError:
+                    return False
         
         return False
     
@@ -449,9 +467,13 @@ class ErrorHandler:
         if file_size > max_file_size:
             raise RuntimeError(f"File {filepath} is too large ({file_size} bytes)")
         
+        timeout_seconds = Config().get('file_operation_timeout', 5)
         try:
-            with open(filepath, 'r') as f:
-                return f.read()
+            with timeout(timeout_seconds):
+                with open(filepath, 'r') as f:
+                    return f.read()
+        except TimeoutError as e:
+            raise RuntimeError(f"Timeout reading {filepath}: {e}")
         except Exception as e:
             raise RuntimeError(f"Failed to read {filepath}: {e}")
     
@@ -567,8 +589,11 @@ class IPUtils:
     @staticmethod
     def hex_to_ipv6(hex_str: str) -> str:
         hex_str = re.sub(r'[^0-9A-Fa-f]', '', hex_str)
-        if len(hex_str) != IPV6_HEX_LENGTH:
+        if not hex_str:
             return '::'
+        
+        if len(hex_str) != IPV6_HEX_LENGTH:
+            hex_str = hex_str.ljust(IPV6_HEX_LENGTH, '0')[:IPV6_HEX_LENGTH]
         
         if not all(c in '0123456789abcdefABCDEF' for c in hex_str):
             return '::'
@@ -620,31 +645,41 @@ class ProcessCache:
     
     @classmethod
     def get_process_map(cls) -> dict:
+        if cls._building:
+            return cls._cache.copy() if cls._cache else {}
+        
         now = time.time()
         ttl = Config().get('process_cache_ttl', 5)
         
         if not cls._cache or (now - cls._last_build) > ttl:
             with cls._lock:
-                if not cls._cache or (now - cls._last_build) > ttl:
+                if (not cls._cache or (now - cls._last_build) > ttl) and not cls._building:
                     cls._misses += 1
                     cls._building = True
                     try:
-                        cls._cache = cls._build_process_map_fast()
-                        cls._last_build = now
-                        cls._last_scan = now
+                        new_cache = cls._build_process_map_fast()
+                        if new_cache or not cls._cache:
+                            cls._cache = new_cache
+                            cls._last_build = now
+                            cls._last_scan = now
+                    except Exception as e:
+                        Logger.get_instance().error(f"Failed to build process cache: {e}")
                     finally:
                         cls._building = False
         else:
             cls._hits += 1
         
-        return cls._cache
+        return cls._cache.copy() if cls._cache else {}
     
     @classmethod
     def _build_process_map_fast(cls) -> dict:
         if not Config().get('enable_process_scan', True):
             return {}
         
-        Security.validate_proc_filesystem()
+        try:
+            Security.validate_proc_filesystem()
+        except RuntimeError:
+            return {}
         
         process_map = {}
         cls._connection_inodes = cls._extract_inodes_from_proc_net_fast()
@@ -657,6 +692,8 @@ class ProcessCache:
         scan_start = time.time()
         max_scan_time = Config().get('max_process_scan_time', 30)
         skip_kernel = Config().get('skip_kernel_threads', True)
+        
+        timeout_seconds = Config().get('file_operation_timeout', 5)
         
         try:
             for entry in os.listdir('/proc'):
@@ -672,31 +709,34 @@ class ProcessCache:
                     continue
                 
                 try:
-                    status_path = f"/proc/{pid}/status"
-                    if not os.path.exists(status_path):
-                        continue
-                    
-                    with open(status_path, 'r') as f:
-                        content = f.read(1024)
-                    
-                    if skip_kernel and 'Kthread' in content:
-                        continue
-                    
-                    inodes = cls._get_process_inodes_fast(pid)
-                    
-                    if inodes:
-                        name_match = re.search(r'Name:\s*(.+)', content)
-                        process_name = name_match.group(1).strip() if name_match else f"PID:{pid}"
+                    with timeout(timeout_seconds):
+                        status_path = f"/proc/{pid}/status"
+                        if not os.path.exists(status_path):
+                            continue
                         
-                        for inode in inodes:
-                            if inode in inode_set:
-                                process_map[inode] = f"{process_name} (PID:{pid})"
-                                if len(process_map) >= len(cls._connection_inodes):
-                                    break
-                except:
+                        with open(status_path, 'r') as f:
+                            content = f.read(1024)
+                        
+                        if skip_kernel and 'Kthread' in content:
+                            continue
+                        
+                        inodes = cls._get_process_inodes_fast(pid)
+                        
+                        if inodes:
+                            name_match = re.search(r'Name:\s*(.+)', content)
+                            process_name = name_match.group(1).strip() if name_match else f"PID:{pid}"
+                            
+                            for inode in inodes:
+                                if inode in inode_set:
+                                    process_map[inode] = f"{process_name} (PID:{pid})"
+                                    if len(process_map) >= len(inode_set):
+                                        break
+                except TimeoutError:
+                    continue
+                except (OSError, IOError):
                     continue
                 
-                if len(process_map) % 500 == 0 and len(process_map) >= len(cls._connection_inodes):
+                if len(process_map) >= len(inode_set):
                     break
         except PermissionError:
             pass
@@ -704,10 +744,12 @@ class ProcessCache:
         return process_map
     
     @classmethod
-    def _extract_inodes_from_proc_net_fast(cls) -> list:
+    def _extract_inodes_from_proc_net_fast(cls) -> List[int]:
         inodes = []
         max_inodes = Config().get('max_inodes_to_scan', 100000)
         files = ['/proc/net/tcp', '/proc/net/tcp6']
+        
+        timeout_seconds = Config().get('file_operation_timeout', 5)
         
         for filepath in files:
             if len(inodes) >= max_inodes:
@@ -717,37 +759,44 @@ class ProcessCache:
                 continue
             
             try:
-                with open(filepath, 'r') as f:
-                    next(f)
-                    for line in f:
-                        match = re.search(r'\s+(\d+)$', line.strip())
-                        if match:
-                            inodes.append(int(match.group(1)))
-                            if len(inodes) >= max_inodes:
-                                break
-            except:
+                with timeout(timeout_seconds):
+                    with open(filepath, 'r') as f:
+                        next(f)
+                        for line in f:
+                            match = re.search(r'\s+(\d+)$', line.strip())
+                            if match:
+                                inodes.append(int(match.group(1)))
+                                if len(inodes) >= max_inodes:
+                                    break
+            except (TimeoutError, OSError, IOError):
                 continue
         
         return list(set(inodes))
     
     @classmethod
-    def _get_process_inodes_fast(cls, pid: int) -> set:
+    def _get_process_inodes_fast(cls, pid: int) -> Set[int]:
         inodes = set()
         fd_path = f"/proc/{pid}/fd"
         
         if not os.path.isdir(fd_path):
             return inodes
         
+        timeout_seconds = Config().get('file_operation_timeout', 5)
+        
         try:
-            for fd in os.listdir(fd_path)[:100]:
+            with timeout(timeout_seconds):
                 try:
-                    link = os.readlink(os.path.join(fd_path, fd))
-                    match = re.search(r'socket:\[(\d+)\]', link)
-                    if match:
-                        inodes.add(int(match.group(1)))
-                except:
+                    for fd in os.listdir(fd_path)[:100]:
+                        try:
+                            link = os.readlink(os.path.join(fd_path, fd))
+                            match = re.search(r'socket:\[(\d+)\]', link)
+                            if match:
+                                inodes.add(int(match.group(1)))
+                        except (OSError, IOError):
+                            pass
+                except OSError:
                     pass
-        except:
+        except TimeoutError:
             pass
         
         return inodes
@@ -785,14 +834,17 @@ class ConnectionCache:
     _lock = threading.Lock()
     
     @classmethod
-    def get_connections(cls, filepath: str, family: int, include_process: bool = False) -> list:
+    def get_connections(cls, filepath: str, family: int, include_process: bool = False) -> List[Connection]:
         max_connections = Config().get('max_connections_per_scan', 50000)
+        timeout_seconds = Config().get('file_operation_timeout', 5)
         
         try:
-            stat = os.stat(filepath)
-            cache_key = f"{filepath}_{family}_{include_process}_{stat.st_mtime}_{stat.st_size}"
-        except:
-            cache_key = f"{filepath}_{family}_{include_process}"
+            with timeout(timeout_seconds):
+                stat = os.stat(filepath)
+        except (TimeoutError, OSError):
+            return []
+        
+        cache_key = f"{filepath}_{family}_{include_process}_{stat.st_mtime}_{stat.st_size}"
         
         with cls._lock:
             if cache_key in cls._cache:
@@ -819,60 +871,63 @@ class ConnectionCache:
             return connections.copy()
     
     @classmethod
-    def _read_connections_fast(cls, filepath: str, family: int, include_process: bool) -> list:
+    def _read_connections_fast(cls, filepath: str, family: int, include_process: bool) -> List[Connection]:
         if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
             return []
         
         connections = []
         process_map = ProcessCache.get_process_map() if include_process else {}
         
+        timeout_seconds = Config().get('file_operation_timeout', 5)
+        
         try:
-            with open(filepath, 'r') as f:
-                next(f)
-                
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
+            with timeout(timeout_seconds):
+                with open(filepath, 'r') as f:
+                    next(f)
                     
-                    fields = re.split(r'\s+', line)
-                    if len(fields) < 10:
-                        continue
-                    
-                    try:
-                        local = fields[1].split(':')
-                        remote = fields[2].split(':')
-                        
-                        if len(local) != 2 or len(remote) != 2:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
                             continue
                         
-                        if family == AF_INET:
-                            local_ip = IPUtils.hex_to_ipv4(local[0])
-                            remote_ip = IPUtils.hex_to_ipv4(remote[0])
-                        else:
-                            local_ip = IPUtils.hex_to_ipv6(local[0])
-                            remote_ip = IPUtils.hex_to_ipv6(remote[0])
+                        fields = re.split(r'\s+', line)
+                        if len(fields) < 10:
+                            continue
                         
-                        local_port = int(local[1], 16)
-                        remote_port = int(remote[1], 16)
-                        state_code = fields[3].upper()
-                        state = TCP_STATES.get(state_code, f"UNKNOWN")
-                        proto = 'IPv4' if family == AF_INET else 'IPv6'
-                        inode = fields[9]
-                        
-                        process = ''
-                        if include_process and inode.isdigit():
-                            process = process_map.get(int(inode), '')
-                        
-                        connections.append(Connection(
-                            proto=proto, state=state, local_ip=local_ip,
-                            local_port=local_port, remote_ip=remote_ip,
-                            remote_port=remote_port, inode=inode, process=process
-                        ))
-                    except:
-                        continue
-        except:
-            pass
+                        try:
+                            local = fields[1].split(':')
+                            remote = fields[2].split(':')
+                            
+                            if len(local) != 2 or len(remote) != 2:
+                                continue
+                            
+                            if family == AF_INET:
+                                local_ip = IPUtils.hex_to_ipv4(local[0])
+                                remote_ip = IPUtils.hex_to_ipv4(remote[0])
+                            else:
+                                local_ip = IPUtils.hex_to_ipv6(local[0])
+                                remote_ip = IPUtils.hex_to_ipv6(remote[0])
+                            
+                            local_port = int(local[1], 16)
+                            remote_port = int(remote[1], 16)
+                            state_code = fields[3].upper()
+                            state = TCP_STATES.get(state_code, f"UNKNOWN")
+                            proto = 'IPv4' if family == AF_INET else 'IPv6'
+                            inode = fields[9]
+                            
+                            process = ''
+                            if include_process and inode.isdigit():
+                                process = process_map.get(int(inode), '')
+                            
+                            connections.append(Connection(
+                                proto=proto, state=state, local_ip=local_ip,
+                                local_port=local_port, remote_ip=remote_ip,
+                                remote_port=remote_port, inode=inode, process=process
+                            ))
+                        except (ValueError, IndexError):
+                            continue
+        except (TimeoutError, OSError, IOError):
+            return []
         
         return connections
     
@@ -895,7 +950,7 @@ class ConnectionCache:
 
 class OutputFormatter:
     @staticmethod
-    def format_table(connections: list, show_process: bool = False, use_colors: bool = True) -> str:
+    def format_table(connections: List[Connection], show_process: bool = False, use_colors: bool = True) -> str:
         if not connections:
             return "No connections found.\n"
         
@@ -925,7 +980,7 @@ class OutputFormatter:
         return output
     
     @staticmethod
-    def format_json(connections: list, include_stats: bool = False) -> str:
+    def format_json(connections: List[Connection], include_stats: bool = False) -> str:
         if include_stats:
             output = {
                 'connections': [asdict(c) for c in connections],
@@ -941,7 +996,7 @@ class OutputFormatter:
         return json.dumps(output, indent=2) + "\n"
     
     @staticmethod
-    def format_csv(connections: list) -> str:
+    def format_csv(connections: List[Connection]) -> str:
         if not connections:
             return ""
         
@@ -957,7 +1012,7 @@ class OutputFormatter:
         return output
     
     @staticmethod
-    def format_statistics(connections: list, use_colors: bool = True) -> str:
+    def format_statistics(connections: List[Connection], use_colors: bool = True) -> str:
         stats = OutputFormatter._get_connection_stats(connections)
         output = "\nDETAILED TCP CONNECTION STATISTICS\n"
         output += "=" * 50 + "\n"
@@ -985,7 +1040,7 @@ class OutputFormatter:
         return output
     
     @staticmethod
-    def _get_connection_stats(connections: list) -> dict:
+    def _get_connection_stats(connections: List[Connection]) -> dict:
         stats = {
             'total': len(connections),
             'ipv4': 0,
@@ -1006,7 +1061,7 @@ class OutputFormatter:
             if conn.process:
                 stats['by_process'][conn.process] += 1
         
-        return stats
+        return dict(stats)
     
     @staticmethod
     def _format_summary(stats: dict, use_colors: bool = True) -> str:
@@ -1029,35 +1084,43 @@ class OutputFormatter:
 
 class ConnectionFilter:
     @staticmethod
-    def filter(connections: list, options: dict) -> list:
-        filtered = connections.copy()
-        
+    def filter(connections: List[Connection], options: dict) -> List[Connection]:
         states = ConnectionFilter._get_requested_states(options)
-        if states:
-            filtered = [c for c in filtered if c.state in states]
+        port = options.get('port')
+        local_ip = options.get('local_ip')
+        remote_ip = options.get('remote_ip')
+        ipv4_only = options.get('ipv4', False)
+        ipv6_only = options.get('ipv6', False)
         
-        if 'port' in options and options['port']:
-            port = int(options['port'])
-            filtered = [c for c in filtered if c.local_port == port or c.remote_port == port]
+        if not any([states, port, local_ip, remote_ip, ipv4_only, ipv6_only]):
+            return connections
         
-        if 'local_ip' in options and options['local_ip']:
-            local_ip = options['local_ip']
-            filtered = [c for c in filtered if ConnectionFilter._ip_matches_filter(c.local_ip, local_ip)]
+        result = []
+        for conn in connections:
+            if states and conn.state not in states:
+                continue
+            
+            if port and conn.local_port != port and conn.remote_port != port:
+                continue
+            
+            if local_ip and not ConnectionFilter._ip_matches_filter(conn.local_ip, local_ip):
+                continue
+            
+            if remote_ip and not ConnectionFilter._ip_matches_filter(conn.remote_ip, remote_ip):
+                continue
+            
+            if ipv4_only and conn.proto != 'IPv4':
+                continue
+            
+            if ipv6_only and conn.proto != 'IPv6':
+                continue
+            
+            result.append(conn)
         
-        if 'remote_ip' in options and options['remote_ip']:
-            remote_ip = options['remote_ip']
-            filtered = [c for c in filtered if ConnectionFilter._ip_matches_filter(c.remote_ip, remote_ip)]
-        
-        if 'ipv4' in options and options['ipv4']:
-            filtered = [c for c in filtered if c.proto == 'IPv4']
-        
-        if 'ipv6' in options and options['ipv6']:
-            filtered = [c for c in filtered if c.proto == 'IPv6']
-        
-        return filtered
+        return result
     
     @staticmethod
-    def _get_requested_states(options: dict) -> list:
+    def _get_requested_states(options: dict) -> List[str]:
         states = []
         if options.get('listen'):
             states.append('LISTEN')
@@ -1084,7 +1147,7 @@ class ConnectionHistory:
     _lock = threading.Lock()
     
     @classmethod
-    def track_changes(cls, current: list) -> dict:
+    def track_changes(cls, current: List[Connection]) -> dict:
         changes = {
             'timestamp': time.time(),
             'total': len(current),
@@ -1147,7 +1210,7 @@ class TCPConnectionMonitor:
     def __init__(self, options: dict):
         self.options = options
     
-    def get_connections(self) -> list:
+    def get_connections(self) -> List[Connection]:
         if not RateLimiter.check_limit():
             return []
         
