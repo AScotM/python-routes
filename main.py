@@ -15,6 +15,7 @@ import functools
 import logging
 import csv
 import re
+import atexit
 from typing import Dict, List, Optional, Tuple, Any, Set, Union, Iterator
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -35,6 +36,7 @@ MIN_CIDR_IPV4 = 0
 MAX_CIDR_IPV4 = 32
 MIN_CIDR_IPV6 = 0
 MAX_CIDR_IPV6 = 128
+PROC_NET_PATHS = ['/proc/net/tcp', '/proc/net/tcp6']
 
 TCP_STATES = {
     '01': "ESTABLISHED",
@@ -77,36 +79,49 @@ def timeout(seconds: int):
         signal.alarm(0)
         signal.signal(signal.SIGALRM, original_handler)
 
+class ConfigError(Exception):
+    pass
+
+@dataclass
+class ConfigEntry:
+    value: Any
+    min_value: Optional[Union[int, float]] = None
+    max_value: Optional[Union[int, float]] = None
+    value_type: type = str
+
 class Config:
     _instance = None
-    _config = {}
+    _config: Dict[str, ConfigEntry] = {}
     _defaults = {
-        'refresh_interval': 2,
-        'max_display_processes': 10,
-        'process_cache_ttl': 5,
-        'connection_cache_ttl': 1,
-        'colors_enabled': True,
-        'max_history': 1000,
-        'rate_limit_requests': 100,
-        'rate_limit_window': 60,
-        'max_cache_size': 10000,
-        'max_connections_per_scan': 50000,
-        'socket_read_timeout': 5,
-        'enable_process_scan': True,
-        'log_level': 'INFO',
-        'max_file_size': 10485760,
-        'memory_warning_threshold': 268435456,
-        'memory_critical_threshold': 402653184,
-        'max_pid': 4194304,
-        'max_cache_entries': 10000,
-        'max_process_scan_time': 30,
-        'process_scan_cooldown': 2,
-        'max_inodes_to_scan': 100000,
-        'max_watch_connections': 100000,
-        'cache_rebuild_lock_timeout': 30,
-        'fast_process_scan': True,
-        'skip_kernel_threads': True,
-        'file_operation_timeout': 5,
+        'refresh_interval': ConfigEntry(2, 1, 60, int),
+        'max_display_processes': ConfigEntry(10, 1, 1000, int),
+        'process_cache_ttl': ConfigEntry(5, 1, 300, int),
+        'connection_cache_ttl': ConfigEntry(1, 1, 60, int),
+        'colors_enabled': ConfigEntry(True, None, None, bool),
+        'max_history': ConfigEntry(1000, 10, 10000, int),
+        'rate_limit_requests': ConfigEntry(100, 1, 1000, int),
+        'rate_limit_window': ConfigEntry(60, 1, 3600, int),
+        'max_cache_size': ConfigEntry(10000, 100, 100000, int),
+        'max_cache_age': ConfigEntry(300, 60, 86400, int),
+        'max_connections_per_scan': ConfigEntry(50000, 1000, 500000, int),
+        'socket_read_timeout': ConfigEntry(5, 1, 30, int),
+        'enable_process_scan': ConfigEntry(True, None, None, bool),
+        'log_level': ConfigEntry('INFO', None, None, str),
+        'max_file_size': ConfigEntry(10485760, 1024, 1073741824, int),
+        'memory_warning_threshold': ConfigEntry(268435456, 1048576, 1073741824, int),
+        'memory_critical_threshold': ConfigEntry(402653184, 1048576, 1073741824, int),
+        'max_pid': ConfigEntry(4194304, 1, 4194304, int),
+        'max_cache_entries': ConfigEntry(10000, 100, 100000, int),
+        'max_process_scan_time': ConfigEntry(30, 1, 300, int),
+        'process_scan_cooldown': ConfigEntry(2, 1, 60, int),
+        'max_inodes_to_scan': ConfigEntry(100000, 1000, 1000000, int),
+        'max_watch_connections': ConfigEntry(100000, 1000, 1000000, int),
+        'cache_rebuild_lock_timeout': ConfigEntry(30, 1, 300, int),
+        'fast_process_scan': ConfigEntry(True, None, None, bool),
+        'skip_kernel_threads': ConfigEntry(True, None, None, bool),
+        'file_operation_timeout': ConfigEntry(5, 1, 30, int),
+        'log_max_bytes': ConfigEntry(10485760, 1024, 1073741824, int),
+        'log_backup_count': ConfigEntry(5, 0, 100, int),
     }
     
     def __new__(cls):
@@ -119,23 +134,40 @@ class Config:
         env_key = f'TCP_MONITOR_{key.upper()}'
         if env_key in os.environ:
             return self._cast_value(os.environ[env_key], key)
-        return self._config.get(key, default)
+        entry = self._config.get(key)
+        if entry:
+            return entry.value
+        return default
     
     def set(self, key: str, value):
-        if key in self._defaults:
-            value = self._cast_value(value, key)
-        self._config[key] = value
+        if key not in self._defaults:
+            return
+        
+        default_entry = self._defaults[key]
+        value = self._cast_value(value, key)
+        
+        if default_entry.min_value is not None and value < default_entry.min_value:
+            raise ConfigError(f"Config '{key}' value {value} is less than minimum {default_entry.min_value}")
+        
+        if default_entry.max_value is not None and value > default_entry.max_value:
+            raise ConfigError(f"Config '{key}' value {value} is greater than maximum {default_entry.max_value}")
+        
+        if key in self._config:
+            self._config[key].value = value
+        else:
+            self._config[key] = ConfigEntry(value, default_entry.min_value, default_entry.max_value, default_entry.value_type)
     
     def _cast_value(self, value, key: str):
         if key not in self._defaults:
             return value
         
-        default = self._defaults[key]
-        if isinstance(default, bool):
+        default_entry = self._defaults[key]
+        
+        if default_entry.value_type == bool:
             return str(value).lower() in ('true', '1', 'yes')
-        elif isinstance(default, int):
+        elif default_entry.value_type == int:
             return int(value)
-        elif isinstance(default, float):
+        elif default_entry.value_type == float:
             return float(value)
         return str(value)
     
@@ -149,13 +181,6 @@ class Config:
             
             for key, value in config.items():
                 if key in self._defaults:
-                    expected_type = type(self._defaults[key])
-                    if not isinstance(value, expected_type):
-                        raise ValueError(f"Config '{key}' expects type {expected_type.__name__}")
-                    
-                    if any(x in key for x in ['threshold', 'max_', 'limit']) and value < 0:
-                        raise ValueError(f"Config '{key}' must be positive")
-                    
                     self.set(key, value)
         except Exception as e:
             raise RuntimeError(f"Failed to load config file: {e}")
@@ -184,9 +209,53 @@ class Config:
         except Exception as e:
             raise RuntimeError(f"Failed to load env file: {e}")
     
+    def validate_required(self):
+        required_keys = ['refresh_interval', 'max_cache_size', 'file_operation_timeout']
+        for key in required_keys:
+            if key not in self._config:
+                raise ConfigError(f"Missing required config: {key}")
+    
     def reload(self):
         self._config = self._defaults.copy()
         self.load_from_env()
+
+class RotatingFileHandler:
+    def __init__(self, filename: str, max_bytes: int = 10485760, backup_count: int = 5):
+        self.filename = filename
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        self._ensure_directory()
+    
+    def _ensure_directory(self):
+        log_dir = os.path.dirname(self.filename)
+        if log_dir and not os.path.isdir(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+    
+    def _rotate(self):
+        if not os.path.exists(self.filename):
+            return
+        
+        if os.path.getsize(self.filename) < self.max_bytes:
+            return
+        
+        for i in range(self.backup_count - 1, 0, -1):
+            src = f"{self.filename}.{i}"
+            dst = f"{self.filename}.{i + 1}"
+            if os.path.exists(src):
+                if os.path.exists(dst):
+                    os.remove(dst)
+                os.rename(src, dst)
+        
+        if os.path.exists(self.filename):
+            dst = f"{self.filename}.1"
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.rename(self.filename, dst)
+    
+    def write(self, content: str):
+        self._rotate()
+        with open(self.filename, 'a') as f:
+            f.write(content + '\n')
 
 class Logger:
     _instance = None
@@ -194,6 +263,7 @@ class Logger:
     _log_level = logging.INFO
     _buffer = []
     _BUFFER_SIZE = 100
+    _file_handler: Optional[RotatingFileHandler] = None
     
     LEVELS = {
         'DEBUG': logging.DEBUG,
@@ -216,8 +286,6 @@ class Logger:
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
         self.logger.addHandler(console_handler)
-        
-        self.file_handler = None
     
     def set_log_level(self, level: str):
         level = level.upper()
@@ -233,12 +301,30 @@ class Logger:
         if log_dir and not os.access(log_dir, os.W_OK):
             raise RuntimeError(f"Log directory not writable: {log_dir}")
         
-        if self.file_handler:
-            self.logger.removeHandler(self.file_handler)
+        max_bytes = Config().get('log_max_bytes', 10485760)
+        backup_count = Config().get('log_backup_count', 5)
         
-        self.file_handler = logging.FileHandler(filepath)
-        self.file_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
-        self.logger.addHandler(self.file_handler)
+        self._file_handler = RotatingFileHandler(filepath, max_bytes, backup_count)
+        
+        for handler in self.logger.handlers[:]:
+            if isinstance(handler, logging.FileHandler):
+                self.logger.removeHandler(handler)
+        
+        class RotatingFileLogHandler(logging.Handler):
+            def __init__(self, rotating_handler):
+                super().__init__()
+                self.rotating_handler = rotating_handler
+            
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    self.rotating_handler.write(msg)
+                except Exception:
+                    self.handleError(record)
+        
+        file_handler = RotatingFileLogHandler(self._file_handler)
+        file_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s'))
+        self.logger.addHandler(file_handler)
     
     def debug(self, message: str):
         self.logger.debug(message)
@@ -356,20 +442,20 @@ class RateLimiter:
     _requests = deque()
     _last_cleanup = 0
     _lock = threading.Lock()
+    _max_requests = Config().get('rate_limit_requests', 100)
+    _window = Config().get('rate_limit_window', 60)
     
     @classmethod
     def check_limit(cls) -> bool:
-        max_requests = Config().get('rate_limit_requests', 100)
-        window = Config().get('rate_limit_window', 60)
         now = time.time()
         
         with cls._lock:
             if now - cls._last_cleanup > 5:
-                while cls._requests and cls._requests[0] < now - window:
+                while cls._requests and cls._requests[0] < now - cls._window:
                     cls._requests.popleft()
                 cls._last_cleanup = now
             
-            if len(cls._requests) >= max_requests:
+            if len(cls._requests) >= cls._max_requests:
                 return False
             
             cls._requests.append(now)
@@ -379,6 +465,11 @@ class RateLimiter:
     def get_current_count(cls) -> int:
         with cls._lock:
             return len(cls._requests)
+    
+    @classmethod
+    def update_config(cls):
+        cls._max_requests = Config().get('rate_limit_requests', 100)
+        cls._window = Config().get('rate_limit_window', 60)
 
 class PerformanceTracker:
     _start_time = time.time()
@@ -389,6 +480,7 @@ class PerformanceTracker:
     _gc_triggered = False
     _last_check = 0
     _lock = threading.Lock()
+    _max_checks = 100
     
     @classmethod
     def start(cls):
@@ -416,10 +508,6 @@ class PerformanceTracker:
                 cls._timers[name]['count'] += 1
     
     @classmethod
-    def _check_memory_usage(cls):
-        pass
-    
-    @classmethod
     def get_metrics(cls) -> dict:
         end_time = time.time()
         metrics = {
@@ -441,16 +529,20 @@ class PerformanceTracker:
         if timers:
             metrics['timers'] = timers
         
+        if cls._memory_checks:
+            metrics['memory_checks'] = cls._memory_checks[-10:]
+        
         return metrics
     
     @classmethod
     def reset(cls):
-        cls._start_time = time.time()
-        cls._operations = 0
-        cls._memory_checks = []
-        cls._timers = {}
-        cls._gc_triggered = False
-        cls._last_check = int(time.time())
+        with cls._lock:
+            cls._start_time = time.time()
+            cls._operations = 0
+            cls._memory_checks = []
+            cls._timers = {}
+            cls._gc_triggered = False
+            cls._last_check = int(time.time())
 
 class ErrorHandler:
     @staticmethod
@@ -490,10 +582,17 @@ class ErrorHandler:
 class TempFileRegistry:
     _files = []
     _lock = threading.Lock()
+    _max_files = 1000
     
     @classmethod
     def register(cls, filepath: str):
         with cls._lock:
+            if len(cls._files) >= cls._max_files:
+                oldest = cls._files.pop(0)
+                try:
+                    os.unlink(oldest)
+                except:
+                    pass
             cls._files.append(filepath)
     
     @classmethod
@@ -510,6 +609,28 @@ class TempFileRegistry:
     def get_registered_files(cls) -> list:
         with cls._lock:
             return cls._files.copy()
+    
+    @classmethod
+    def set_max_files(cls, max_files: int):
+        cls._max_files = max_files
+
+class FileReader:
+    _handles = {}
+    _lock = threading.Lock()
+    _max_handles = 10
+    
+    @classmethod
+    def read(cls, path: str, timeout: int = 5) -> Optional[str]:
+        try:
+            with timeout(timeout):
+                with open(path, 'r') as f:
+                    return f.read()
+        except:
+            return None
+    
+    @classmethod
+    def close_all(cls):
+        pass
 
 class InputValidator:
     @staticmethod
@@ -576,35 +697,36 @@ class InputValidator:
 class IPUtils:
     @staticmethod
     def hex_to_ipv4(hex_str: str) -> str:
-        hex_str = re.sub(r'[^0-9A-Fa-f]', '', hex_str)
-        if len(hex_str) != IPV4_HEX_LENGTH:
+        hex_str = hex_str.strip()
+        if len(hex_str) != 8:
             return '0.0.0.0'
         
-        parts = []
-        for i in range(0, IPV4_HEX_LENGTH, 2):
-            parts.append(str(int(hex_str[i:i+2], 16)))
-        
-        return '.'.join(reversed(parts))
+        try:
+            ip_int = int(hex_str, 16)
+            return str(ipaddress.IPv4Address(ip_int))
+        except:
+            return '0.0.0.0'
     
     @staticmethod
     def hex_to_ipv6(hex_str: str) -> str:
-        hex_str = re.sub(r'[^0-9A-Fa-f]', '', hex_str)
-        if not hex_str:
+        hex_str = hex_str.strip()
+        if len(hex_str) != 32:
             return '::'
-        
-        if len(hex_str) != IPV6_HEX_LENGTH:
-            hex_str = hex_str.ljust(IPV6_HEX_LENGTH, '0')[:IPV6_HEX_LENGTH]
-        
-        if not all(c in '0123456789abcdefABCDEF' for c in hex_str):
-            return '::'
-        
-        blocks = [hex_str[i:i+8] for i in range(0, IPV6_HEX_LENGTH, 8)]
-        blocks.reverse()
-        reordered = ''.join(blocks)
         
         try:
-            packed = bytes.fromhex(reordered)
-            return str(ipaddress.ip_address(packed))
+            parts = []
+            for i in range(0, 32, 8):
+                part = hex_str[i:i+8]
+                parts.append(part)
+            
+            ipv6_parts = []
+            for part in parts:
+                ipv6_parts.extend([part[j:j+4] for j in range(0, 8, 4)])
+            
+            ipv6_str = ':'.join(ipv6_parts)
+            
+            packed = bytes.fromhex(''.join(ipv6_parts))
+            return str(ipaddress.IPv6Address(packed))
         except:
             return '::'
     
@@ -632,19 +754,27 @@ class Connection:
     def key(self) -> str:
         return f"{self.local_ip}:{self.local_port}-{self.remote_ip}:{self.remote_port}-{self.state}"
 
+@dataclass
+class CacheEntry:
+    data: Any
+    timestamp: float
+    ttl: int = 300
+
 class ProcessCache:
-    _cache = {}
+    _cache: Dict[int, str] = {}
+    _cache_timestamp: Dict[int, float] = {}
     _last_build = 0
     _building = False
-    _connection_inodes = None
+    _connection_inodes: Optional[Set[int]] = None
     _hits = 0
     _misses = 0
     _last_scan = 0
     _lock = threading.Lock()
-    _inode_to_pid = {}
+    _inode_to_pid: Dict[int, int] = {}
+    _max_cache_size = Config().get('max_cache_entries', 10000)
     
     @classmethod
-    def get_process_map(cls) -> dict:
+    def get_process_map(cls) -> Dict[int, str]:
         if cls._building:
             return cls._cache.copy() if cls._cache else {}
         
@@ -672,7 +802,7 @@ class ProcessCache:
         return cls._cache.copy() if cls._cache else {}
     
     @classmethod
-    def _build_process_map_fast(cls) -> dict:
+    def _build_process_map_fast(cls) -> Dict[int, str]:
         if not Config().get('enable_process_scan', True):
             return {}
         
@@ -682,12 +812,12 @@ class ProcessCache:
             return {}
         
         process_map = {}
-        cls._connection_inodes = cls._extract_inodes_from_proc_net_fast()
+        connection_inodes = cls._extract_inodes_from_proc_net_fast()
         
-        if not cls._connection_inodes:
+        if not connection_inodes:
             return process_map
         
-        inode_set = set(cls._connection_inodes)
+        inode_set = set(connection_inodes)
         
         scan_start = time.time()
         max_scan_time = Config().get('max_process_scan_time', 30)
@@ -715,15 +845,15 @@ class ProcessCache:
                             continue
                         
                         with open(status_path, 'r') as f:
-                            content = f.read(1024)
+                            status_content = f.read(1024)
                         
-                        if skip_kernel and 'Kthread' in content:
+                        if skip_kernel and 'Kthread' in status_content:
                             continue
                         
                         inodes = cls._get_process_inodes_fast(pid)
                         
                         if inodes:
-                            name_match = re.search(r'Name:\s*(.+)', content)
+                            name_match = re.search(r'Name:\s*(.+)', status_content)
                             process_name = name_match.group(1).strip() if name_match else f"PID:{pid}"
                             
                             for inode in inodes:
@@ -747,11 +877,9 @@ class ProcessCache:
     def _extract_inodes_from_proc_net_fast(cls) -> List[int]:
         inodes = []
         max_inodes = Config().get('max_inodes_to_scan', 100000)
-        files = ['/proc/net/tcp', '/proc/net/tcp6']
-        
         timeout_seconds = Config().get('file_operation_timeout', 5)
         
-        for filepath in files:
+        for filepath in PROC_NET_PATHS:
             if len(inodes) >= max_inodes:
                 break
             
@@ -768,7 +896,7 @@ class ProcessCache:
                                 inodes.append(int(match.group(1)))
                                 if len(inodes) >= max_inodes:
                                     break
-            except (TimeoutError, OSError, IOError):
+            except:
                 continue
         
         return list(set(inodes))
@@ -805,6 +933,7 @@ class ProcessCache:
     def clear_cache(cls):
         with cls._lock:
             cls._cache = {}
+            cls._cache_timestamp = {}
             cls._last_build = 0
             cls._hits = 0
             cls._misses = 0
@@ -828,7 +957,7 @@ class ProcessCache:
         }
 
 class ConnectionCache:
-    _cache = {}
+    _cache: Dict[str, CacheEntry] = {}
     _hits = 0
     _misses = 0
     _lock = threading.Lock()
@@ -837,6 +966,7 @@ class ConnectionCache:
     def get_connections(cls, filepath: str, family: int, include_process: bool = False) -> List[Connection]:
         max_connections = Config().get('max_connections_per_scan', 50000)
         timeout_seconds = Config().get('file_operation_timeout', 5)
+        max_age = Config().get('max_cache_age', 300)
         
         try:
             with timeout(timeout_seconds):
@@ -847,9 +977,15 @@ class ConnectionCache:
         cache_key = f"{filepath}_{family}_{include_process}_{stat.st_mtime}_{stat.st_size}"
         
         with cls._lock:
+            now = time.time()
+            
             if cache_key in cls._cache:
-                cls._hits += 1
-                return cls._cache[cache_key]['data'].copy()
+                entry = cls._cache[cache_key]
+                if now - entry.timestamp < max_age:
+                    cls._hits += 1
+                    return entry.data.copy()
+                else:
+                    del cls._cache[cache_key]
             
             cls._misses += 1
             
@@ -859,13 +995,10 @@ class ConnectionCache:
                 if len(connections) > max_connections:
                     connections = connections[:max_connections]
                 
-                cls._cache[cache_key] = {
-                    'data': connections,
-                    'timestamp': time.time()
-                }
+                cls._cache[cache_key] = CacheEntry(connections, now)
                 
                 if len(cls._cache) > Config().get('max_cache_size', 10000):
-                    oldest = min(cls._cache.keys(), key=lambda k: cls._cache[k]['timestamp'])
+                    oldest = min(cls._cache.keys(), key=lambda k: cls._cache[k].timestamp)
                     del cls._cache[oldest]
             
             return connections.copy()
@@ -883,50 +1016,63 @@ class ConnectionCache:
         try:
             with timeout(timeout_seconds):
                 with open(filepath, 'r') as f:
-                    next(f)
+                    lines = f.readlines()
+                
+                if not lines:
+                    return []
+                
+                for line in lines[1:]:
+                    line = line.strip()
+                    if not line:
+                        continue
                     
-                    for line in f:
-                        line = line.strip()
-                        if not line:
+                    fields = re.split(r'\s+', line)
+                    if len(fields) < 10:
+                        continue
+                    
+                    try:
+                        local_addr = fields[1]
+                        remote_addr = fields[2]
+                        
+                        local_parts = local_addr.split(':')
+                        remote_parts = remote_addr.split(':')
+                        
+                        if len(local_parts) != 2 or len(remote_parts) != 2:
                             continue
                         
-                        fields = re.split(r'\s+', line)
-                        if len(fields) < 10:
-                            continue
+                        local_ip_hex = local_parts[0]
+                        local_port_hex = local_parts[1]
+                        remote_ip_hex = remote_parts[0]
+                        remote_port_hex = remote_parts[1]
                         
-                        try:
-                            local = fields[1].split(':')
-                            remote = fields[2].split(':')
-                            
-                            if len(local) != 2 or len(remote) != 2:
-                                continue
-                            
-                            if family == AF_INET:
-                                local_ip = IPUtils.hex_to_ipv4(local[0])
-                                remote_ip = IPUtils.hex_to_ipv4(remote[0])
-                            else:
-                                local_ip = IPUtils.hex_to_ipv6(local[0])
-                                remote_ip = IPUtils.hex_to_ipv6(remote[0])
-                            
-                            local_port = int(local[1], 16)
-                            remote_port = int(remote[1], 16)
-                            state_code = fields[3].upper()
-                            state = TCP_STATES.get(state_code, f"UNKNOWN")
-                            proto = 'IPv4' if family == AF_INET else 'IPv6'
-                            inode = fields[9]
-                            
-                            process = ''
-                            if include_process and inode.isdigit():
-                                process = process_map.get(int(inode), '')
-                            
-                            connections.append(Connection(
-                                proto=proto, state=state, local_ip=local_ip,
-                                local_port=local_port, remote_ip=remote_ip,
-                                remote_port=remote_port, inode=inode, process=process
-                            ))
-                        except (ValueError, IndexError):
-                            continue
-        except (TimeoutError, OSError, IOError):
+                        if family == AF_INET:
+                            local_ip = IPUtils.hex_to_ipv4(local_ip_hex)
+                            remote_ip = IPUtils.hex_to_ipv4(remote_ip_hex)
+                        else:
+                            local_ip = IPUtils.hex_to_ipv6(local_ip_hex)
+                            remote_ip = IPUtils.hex_to_ipv6(remote_ip_hex)
+                        
+                        local_port = int(local_port_hex, 16)
+                        remote_port = int(remote_port_hex, 16)
+                        state_code = fields[3].upper()
+                        state = TCP_STATES.get(state_code, f"UNKNOWN-{state_code}")
+                        proto = 'IPv4' if family == AF_INET else 'IPv6'
+                        inode = fields[9]
+                        
+                        process = ''
+                        if include_process and inode.isdigit():
+                            inode_int = int(inode)
+                            if inode_int in process_map:
+                                process = process_map[inode_int]
+                        
+                        connections.append(Connection(
+                            proto=proto, state=state, local_ip=local_ip,
+                            local_port=local_port, remote_ip=remote_ip,
+                            remote_port=remote_port, inode=inode, process=process
+                        ))
+                    except (ValueError, IndexError) as e:
+                        continue
+        except Exception as e:
             return []
         
         return connections
@@ -1185,6 +1331,7 @@ class SignalHandler:
     _should_exit = False
     _start_time = time.time()
     _initialized = False
+    _cleanup_functions = []
     
     @classmethod
     def init(cls):
@@ -1196,6 +1343,8 @@ class SignalHandler:
         
         signal.signal(signal.SIGINT, cls._handle_signal)
         signal.signal(signal.SIGTERM, cls._handle_signal)
+        
+        atexit.register(cls._cleanup)
     
     @classmethod
     def _handle_signal(cls, signum, frame):
@@ -1205,6 +1354,18 @@ class SignalHandler:
     @classmethod
     def should_exit(cls) -> bool:
         return cls._should_exit
+    
+    @classmethod
+    def register_cleanup(cls, func):
+        cls._cleanup_functions.append(func)
+    
+    @classmethod
+    def _cleanup(cls):
+        for func in cls._cleanup_functions:
+            try:
+                func()
+            except:
+                pass
 
 class TCPConnectionMonitor:
     def __init__(self, options: dict):
@@ -1321,6 +1482,10 @@ def display_performance_metrics(options):
         print(f"  Process cache: {process_stats['cache_size']} entries, {process_stats['hit_rate']}% hits")
         print(f"  Connection cache: {connection_stats['cache_entries']} entries, {connection_stats['hit_rate']}% hits")
 
+def cleanup():
+    TempFileRegistry.cleanup()
+    Logger.get_instance().info("Cleanup completed")
+
 def main():
     try:
         PerformanceTracker.start()
@@ -1345,6 +1510,9 @@ def main():
             config.load_from_file(options.config)
         
         config.load_from_env()
+        config.validate_required()
+        
+        RateLimiter.update_config()
         
         logger = Logger.get_instance()
         if options.debug:
@@ -1355,6 +1523,9 @@ def main():
         
         if options.no_processes:
             ProcessCache.disable_process_scan()
+        
+        SignalHandler.init()
+        SignalHandler.register_cleanup(cleanup)
         
         monitor = TCPConnectionMonitor(vars(options))
         
@@ -1391,11 +1562,14 @@ def main():
         
     except KeyboardInterrupt:
         return 130
+    except ConfigError as e:
+        ErrorHandler.handle_exception(e, True)
+        return 1
     except Exception as e:
         ErrorHandler.handle_exception(e, options.verbose if 'options' in locals() else False)
         return 1
     finally:
-        TempFileRegistry.cleanup()
+        cleanup()
     
     return 0
 
