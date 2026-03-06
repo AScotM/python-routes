@@ -5,24 +5,21 @@ import sys
 import time
 import json
 import signal
-import socket
-import struct
 import ipaddress
 import argparse
 import tempfile
 import threading
-import functools
 import logging
 import csv
 import re
 import atexit
-from typing import Dict, List, Optional, Tuple, Any, Set, Union, Iterator
+import mmap
+import tracemalloc
+import resource
+from typing import Dict, List, Optional, Tuple, Any, Set, Union
 from dataclasses import dataclass, field, asdict
-from enum import Enum
-from pathlib import Path
 from collections import defaultdict, deque
 from contextlib import contextmanager
-import resource
 
 AF_INET = 2
 AF_INET6 = 10
@@ -37,6 +34,8 @@ MAX_CIDR_IPV4 = 32
 MIN_CIDR_IPV6 = 0
 MAX_CIDR_IPV6 = 128
 PROC_NET_PATHS = ['/proc/net/tcp', '/proc/net/tcp6']
+MAX_PATH_LENGTH = 4096
+MAX_IP_STRING_LENGTH = 256
 
 TCP_STATES = {
     '01': "ESTABLISHED",
@@ -92,6 +91,7 @@ class ConfigEntry:
 class Config:
     _instance = None
     _config: Dict[str, ConfigEntry] = {}
+    _lock = threading.Lock()
     _defaults = {
         'refresh_interval': ConfigEntry(2, 1, 60, int),
         'max_display_processes': ConfigEntry(10, 1, 1000, int),
@@ -122,21 +122,25 @@ class Config:
         'file_operation_timeout': ConfigEntry(5, 1, 30, int),
         'log_max_bytes': ConfigEntry(10485760, 1024, 1073741824, int),
         'log_backup_count': ConfigEntry(5, 0, 100, int),
+        'max_retry_attempts': ConfigEntry(3, 1, 10, int),
+        'retry_base_delay': ConfigEntry(0.1, 0.01, 5.0, float),
     }
     
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._config = cls._defaults.copy()
+            with cls._instance._lock:
+                cls._instance._config = cls._defaults.copy()
         return cls._instance
     
     def get(self, key: str, default=None):
         env_key = f'TCP_MONITOR_{key.upper()}'
         if env_key in os.environ:
             return self._cast_value(os.environ[env_key], key)
-        entry = self._config.get(key)
-        if entry:
-            return entry.value
+        with self._lock:
+            entry = self._config.get(key)
+            if entry:
+                return entry.value
         return default
     
     def set(self, key: str, value):
@@ -152,10 +156,11 @@ class Config:
         if default_entry.max_value is not None and value > default_entry.max_value:
             raise ConfigError(f"Config '{key}' value {value} is greater than maximum {default_entry.max_value}")
         
-        if key in self._config:
-            self._config[key].value = value
-        else:
-            self._config[key] = ConfigEntry(value, default_entry.min_value, default_entry.max_value, default_entry.value_type)
+        with self._lock:
+            if key in self._config:
+                self._config[key].value = value
+            else:
+                self._config[key] = ConfigEntry(value, default_entry.min_value, default_entry.max_value, default_entry.value_type)
     
     def _cast_value(self, value, key: str):
         if key not in self._defaults:
@@ -173,6 +178,9 @@ class Config:
     
     def load_from_file(self, filepath: str):
         try:
+            if os.path.getsize(filepath) > self.get('max_file_size'):
+                raise RuntimeError(f"Config file too large")
+            
             with open(filepath, 'r') as f:
                 config = json.load(f)
             
@@ -216,7 +224,8 @@ class Config:
                 raise ConfigError(f"Missing required config: {key}")
     
     def reload(self):
-        self._config = self._defaults.copy()
+        with self._lock:
+            self._config = self._defaults.copy()
         self.load_from_env()
 
 class RotatingFileHandler:
@@ -224,6 +233,7 @@ class RotatingFileHandler:
         self.filename = filename
         self.max_bytes = max_bytes
         self.backup_count = backup_count
+        self._lock = threading.Lock()
         self._ensure_directory()
     
     def _ensure_directory(self):
@@ -253,9 +263,10 @@ class RotatingFileHandler:
             os.rename(self.filename, dst)
     
     def write(self, content: str):
-        self._rotate()
-        with open(self.filename, 'a') as f:
-            f.write(content + '\n')
+        with self._lock:
+            self._rotate()
+            with open(self.filename, 'a') as f:
+                f.write(content + '\n')
 
 class Logger:
     _instance = None
@@ -264,6 +275,7 @@ class Logger:
     _buffer = []
     _BUFFER_SIZE = 100
     _file_handler: Optional[RotatingFileHandler] = None
+    _lock = threading.Lock()
     
     LEVELS = {
         'DEBUG': logging.DEBUG,
@@ -350,33 +362,34 @@ class Logger:
 class Security:
     @staticmethod
     def validate_path(path: str) -> bool:
-        if '..' in path.split('/') or '//' in path:
+        if len(path) > MAX_PATH_LENGTH:
             return False
         
-        normalized = Security._normalize_path(path)
-        
-        if not normalized.startswith('/proc/'):
+        try:
+            normalized = os.path.realpath(path)
+            if not normalized.startswith('/proc/'):
+                return False
+            
+            if os.path.islink(path):
+                if normalized != os.path.normpath(path):
+                    return False
+        except (OSError, ValueError):
             return False
         
         allowed_patterns = [
             r'^/proc/net/(tcp|tcp6|udp|udp6|raw|raw6|unix)$',
-            r'^/proc/\d+$',
-            r'^/proc/\d+/(comm|status|cmdline|exe|fd|net|fdinfo)$',
-            r'^/proc/\d+/fd/\d+$',
+            r'^/proc/[1-9][0-9]*$',
+            r'^/proc/[1-9][0-9]*/(comm|status|cmdline|exe|fd|net|fdinfo)$',
+            r'^/proc/[1-9][0-9]*/fd/[1-9][0-9]*$',
             r'^/proc/version$',
-            r'^/proc/self$'
+            r'^/proc/self$',
+            r'^/proc/self/(comm|status|cmdline|exe|fd|net|fdinfo)$',
+            r'^/proc/self/fd/[1-9][0-9]*$'
         ]
         
         for pattern in allowed_patterns:
             if re.match(pattern, normalized):
-                try:
-                    if os.path.islink(path):
-                        real_path = os.path.realpath(path)
-                        if not real_path.startswith('/proc/'):
-                            return False
-                    return True
-                except OSError:
-                    return False
+                return True
         
         return False
     
@@ -437,6 +450,32 @@ class Security:
         os.close(fd)
         TempFileRegistry.register(temp_file)
         return temp_file
+    
+    @staticmethod
+    def check_memory_limit(required_bytes: int) -> bool:
+        try:
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            if soft > 0 and required_bytes > int(soft * 0.8):
+                return False
+        except:
+            pass
+        
+        warning_threshold = Config().get('memory_warning_threshold', 268435456)
+        critical_threshold = Config().get('memory_critical_threshold', 402653184)
+        
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+            if required_bytes > available:
+                return False
+            if required_bytes > critical_threshold:
+                Logger.get_instance().warning(f"Memory usage approaching critical threshold: {required_bytes} bytes")
+            elif required_bytes > warning_threshold:
+                Logger.get_instance().warning(f"Memory usage approaching warning threshold: {required_bytes} bytes")
+        except:
+            pass
+        
+        return True
 
 class RateLimiter:
     _requests = deque()
@@ -468,8 +507,9 @@ class RateLimiter:
     
     @classmethod
     def update_config(cls):
-        cls._max_requests = Config().get('rate_limit_requests', 100)
-        cls._window = Config().get('rate_limit_window', 60)
+        with cls._lock:
+            cls._max_requests = Config().get('rate_limit_requests', 100)
+            cls._window = Config().get('rate_limit_window', 60)
 
 class PerformanceTracker:
     _start_time = time.time()
@@ -481,12 +521,18 @@ class PerformanceTracker:
     _last_check = 0
     _lock = threading.Lock()
     _max_checks = 100
+    _tracemalloc_started = False
     
     @classmethod
     def start(cls):
         cls._start_time = time.time()
         cls._memory_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         cls._last_check = int(time.time())
+        try:
+            tracemalloc.start()
+            cls._tracemalloc_started = True
+        except:
+            pass
     
     @classmethod
     def record_operation(cls, type: str = 'general'):
@@ -508,6 +554,25 @@ class PerformanceTracker:
                 cls._timers[name]['count'] += 1
     
     @classmethod
+    def check_memory_usage(cls) -> Tuple[bool, int]:
+        if cls._tracemalloc_started:
+            current, peak = tracemalloc.get_traced_memory()
+            with cls._lock:
+                cls._memory_checks.append({'time': time.time(), 'current': current, 'peak': peak})
+                if len(cls._memory_checks) > cls._max_checks:
+                    cls._memory_checks.pop(0)
+            
+            warning_threshold = Config().get('memory_warning_threshold', 268435456)
+            critical_threshold = Config().get('memory_critical_threshold', 402653184)
+            
+            if current > critical_threshold:
+                return False, current
+            elif current > warning_threshold:
+                return True, current
+        
+        return True, 0
+    
+    @classmethod
     def get_metrics(cls) -> dict:
         end_time = time.time()
         metrics = {
@@ -516,6 +581,11 @@ class PerformanceTracker:
             'operations': cls._operations,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
+        
+        if cls._tracemalloc_started:
+            current, peak = tracemalloc.get_traced_memory()
+            metrics['current_memory_mb'] = round(current / 1048576, 2)
+            metrics['traced_peak_mb'] = round(peak / 1048576, 2)
         
         timers = {}
         for name, timer in cls._timers.items():
@@ -543,6 +613,9 @@ class PerformanceTracker:
             cls._timers = {}
             cls._gc_triggered = False
             cls._last_check = int(time.time())
+            if cls._tracemalloc_started:
+                tracemalloc.stop()
+                tracemalloc.start()
 
 class ErrorHandler:
     @staticmethod
@@ -578,6 +651,22 @@ class ErrorHandler:
         if verbose:
             import traceback
             traceback.print_exc()
+    
+    @staticmethod
+    def retry_operation(func, *args, **kwargs):
+        max_attempts = Config().get('max_retry_attempts', 3)
+        base_delay = Config().get('retry_base_delay', 0.1)
+        
+        last_exception = None
+        for attempt in range(max_attempts):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                if attempt < max_attempts - 1:
+                    time.sleep(base_delay * (2 ** attempt))
+        
+        raise last_exception
 
 class TempFileRegistry:
     _files = []
@@ -629,8 +718,19 @@ class FileReader:
             return None
     
     @classmethod
+    def read_mmap(cls, path: str, timeout: int = 5) -> Optional[str]:
+        try:
+            with timeout(timeout):
+                with open(path, 'rb') as f:
+                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        return mm.read().decode('ascii', errors='ignore')
+        except:
+            return None
+    
+    @classmethod
     def close_all(cls):
-        pass
+        with cls._lock:
+            cls._handles.clear()
 
 class InputValidator:
     @staticmethod
@@ -639,6 +739,8 @@ class InputValidator:
     
     @staticmethod
     def validate_ip_filter(filter_str: str) -> str:
+        if len(filter_str) > MAX_IP_STRING_LENGTH:
+            raise ValueError(f"IP filter string too long")
         if not InputValidator._is_valid_ip_or_cidr(filter_str):
             raise ValueError(f"Invalid IP or CIDR notation: {filter_str}")
         return filter_str
@@ -647,6 +749,9 @@ class InputValidator:
     def _is_valid_ip_or_cidr(input_str: str) -> bool:
         input_str = input_str.strip()
         if not input_str:
+            return False
+        
+        if len(input_str) > MAX_IP_STRING_LENGTH:
             return False
         
         if '/' in input_str:
@@ -680,6 +785,9 @@ class InputValidator:
     
     @staticmethod
     def validate_output_file(filepath: str) -> str:
+        if len(filepath) > MAX_PATH_LENGTH:
+            raise ValueError(f"File path too long")
+        
         directory = os.path.dirname(filepath)
         if directory and not os.path.isdir(directory):
             os.makedirs(directory, exist_ok=True)
@@ -765,41 +873,69 @@ class ProcessCache:
     _cache_timestamp: Dict[int, float] = {}
     _last_build = 0
     _building = False
-    _connection_inodes: Optional[Set[int]] = None
     _hits = 0
     _misses = 0
     _last_scan = 0
     _lock = threading.Lock()
-    _inode_to_pid: Dict[int, int] = {}
     _max_cache_size = Config().get('max_cache_entries', 10000)
     
     @classmethod
     def get_process_map(cls) -> Dict[int, str]:
-        if cls._building:
-            return cls._cache.copy() if cls._cache else {}
-        
         now = time.time()
         ttl = Config().get('process_cache_ttl', 5)
         
-        if not cls._cache or (now - cls._last_build) > ttl:
+        if cls._cache and (now - cls._last_build) <= ttl and not cls._building:
             with cls._lock:
-                if (not cls._cache or (now - cls._last_build) > ttl) and not cls._building:
-                    cls._misses += 1
-                    cls._building = True
-                    try:
-                        new_cache = cls._build_process_map_fast()
-                        if new_cache or not cls._cache:
-                            cls._cache = new_cache
-                            cls._last_build = now
-                            cls._last_scan = now
-                    except Exception as e:
-                        Logger.get_instance().error(f"Failed to build process cache: {e}")
-                    finally:
-                        cls._building = False
-        else:
-            cls._hits += 1
+                if cls._cache and (now - cls._last_build) <= ttl and not cls._building:
+                    cls._hits += 1
+                    return cls._cache.copy()
         
-        return cls._cache.copy() if cls._cache else {}
+        with cls._lock:
+            if cls._cache and (now - cls._last_build) <= ttl and not cls._building:
+                cls._hits += 1
+                return cls._cache.copy()
+            
+            if cls._building:
+                timeout = Config().get('cache_rebuild_lock_timeout', 30)
+                end_time = time.time() + timeout
+                
+                while cls._building and time.time() < end_time:
+                    cls._lock.release()
+                    time.sleep(0.1)
+                    cls._lock.acquire()
+                
+                if cls._building:
+                    Logger.get_instance().warning("Process cache rebuild timed out")
+                    return cls._cache.copy() if cls._cache else {}
+                
+                if cls._cache and (now - cls._last_build) <= ttl:
+                    return cls._cache.copy()
+            
+            ok, memory_used = PerformanceTracker.check_memory_usage()
+            if not ok:
+                Logger.get_instance().warning("Memory usage critical, returning empty process map")
+                return {}
+            
+            cls._misses += 1
+            cls._building = True
+            
+            try:
+                new_cache = cls._build_process_map_fast()
+                if new_cache or not cls._cache:
+                    cls._cache = new_cache
+                    cls._last_build = now
+                    cls._last_scan = now
+                
+                if len(cls._cache) > cls._max_cache_size:
+                    sorted_cache = sorted(cls._cache.items(), key=lambda x: cls._cache_timestamp.get(x[0], 0))
+                    cls._cache = dict(sorted_cache[-cls._max_cache_size:])
+                
+                return cls._cache.copy()
+            except Exception as e:
+                Logger.get_instance().error(f"Failed to build process cache: {e}")
+                return cls._cache.copy() if cls._cache else {}
+            finally:
+                cls._building = False
     
     @classmethod
     def _build_process_map_fast(cls) -> Dict[int, str]:
@@ -811,11 +947,16 @@ class ProcessCache:
         except RuntimeError:
             return {}
         
+        ok, _ = PerformanceTracker.check_memory_usage()
+        if not ok:
+            return {}
+        
         process_map = {}
         connection_inodes = cls._extract_inodes_from_proc_net_fast()
         
-        if not connection_inodes:
-            return process_map
+        max_inodes = Config().get('max_inodes_to_scan', 100000)
+        if len(connection_inodes) > max_inodes:
+            connection_inodes = connection_inodes[:max_inodes]
         
         inode_set = set(connection_inodes)
         
@@ -838,6 +979,11 @@ class ProcessCache:
                 if skip_kernel and pid < 10:
                     continue
                 
+                ok, memory_used = PerformanceTracker.check_memory_usage()
+                if not ok:
+                    Logger.get_instance().warning("Memory critical during process scan, stopping")
+                    break
+                
                 try:
                     with timeout(timeout_seconds):
                         status_path = f"/proc/{pid}/status"
@@ -859,6 +1005,7 @@ class ProcessCache:
                             for inode in inodes:
                                 if inode in inode_set:
                                     process_map[inode] = f"{process_name} (PID:{pid})"
+                                    cls._cache_timestamp[inode] = time.time()
                                     if len(process_map) >= len(inode_set):
                                         break
                 except TimeoutError:
@@ -899,7 +1046,7 @@ class ProcessCache:
             except:
                 continue
         
-        return list(set(inodes))
+        return list(set(inodes))[:max_inodes]
     
     @classmethod
     def _get_process_inodes_fast(cls, pid: int) -> Set[int]:
@@ -939,7 +1086,6 @@ class ProcessCache:
             cls._misses = 0
             cls._last_scan = 0
             cls._building = False
-            cls._inode_to_pid = {}
     
     @classmethod
     def disable_process_scan(cls):
@@ -1015,8 +1161,14 @@ class ConnectionCache:
         
         try:
             with timeout(timeout_seconds):
-                with open(filepath, 'r') as f:
-                    lines = f.readlines()
+                try:
+                    with open(filepath, 'rb') as f:
+                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                            content = mm.read().decode('ascii', errors='ignore')
+                            lines = content.splitlines()
+                except:
+                    with open(filepath, 'r') as f:
+                        lines = f.readlines()
                 
                 if not lines:
                     return []
@@ -1332,28 +1484,35 @@ class SignalHandler:
     _start_time = time.time()
     _initialized = False
     _cleanup_functions = []
+    _lock = threading.Lock()
     
     @classmethod
     def init(cls):
         if cls._initialized:
             return
         
-        cls._start_time = time.time()
-        cls._initialized = True
-        
-        signal.signal(signal.SIGINT, cls._handle_signal)
-        signal.signal(signal.SIGTERM, cls._handle_signal)
-        
-        atexit.register(cls._cleanup)
+        with cls._lock:
+            if cls._initialized:
+                return
+            
+            cls._start_time = time.time()
+            cls._initialized = True
+            
+            signal.signal(signal.SIGINT, cls._handle_signal)
+            signal.signal(signal.SIGTERM, cls._handle_signal)
+            
+            atexit.register(cls._cleanup)
     
     @classmethod
     def _handle_signal(cls, signum, frame):
         if signum in (signal.SIGINT, signal.SIGTERM):
-            cls._should_exit = True
+            with cls._lock:
+                cls._should_exit = True
     
     @classmethod
     def should_exit(cls) -> bool:
-        return cls._should_exit
+        with cls._lock:
+            return cls._should_exit
     
     @classmethod
     def register_cleanup(cls, func):
@@ -1375,11 +1534,26 @@ class TCPConnectionMonitor:
         if not RateLimiter.check_limit():
             return []
         
+        connections = []
         include_process = self.options.get('processes', False)
         
-        connections = []
-        connections.extend(ConnectionCache.get_connections('/proc/net/tcp', AF_INET, include_process))
-        connections.extend(ConnectionCache.get_connections('/proc/net/tcp6', AF_INET6, include_process))
+        retry_count = Config().get('max_retry_attempts', 3)
+        retry_delay = Config().get('retry_base_delay', 0.1)
+        
+        for filepath, family in [('/proc/net/tcp', AF_INET), ('/proc/net/tcp6', AF_INET6)]:
+            for attempt in range(retry_count):
+                try:
+                    conns = ConnectionCache.get_connections(filepath, family, include_process)
+                    connections.extend(conns)
+                    break
+                except (OSError, IOError) as e:
+                    if attempt == retry_count - 1:
+                        Logger.get_instance().error(f"Failed to read {filepath}: {e}")
+                    else:
+                        time.sleep(retry_delay * (2 ** attempt))
+                except Exception as e:
+                    Logger.get_instance().error(f"Unexpected error reading {filepath}: {e}")
+                    break
         
         return ConnectionFilter.filter(connections, self.options)
 
@@ -1484,6 +1658,7 @@ def display_performance_metrics(options):
 
 def cleanup():
     TempFileRegistry.cleanup()
+    FileReader.close_all()
     Logger.get_instance().info("Cleanup completed")
 
 def main():
