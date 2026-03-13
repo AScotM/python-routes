@@ -62,7 +62,14 @@ COLORS = {
     'SYN_RECV': '\033[34m',
     'LAST_ACK': '\033[31m',
     'CLOSING': '\033[33m',
-    'reset': '\033[0m'
+    'reset': '\033[0m',
+    'bold': '\033[1m',
+    'underline': '\033[4m',
+    'header': '\033[95m',
+    'info': '\033[94m',
+    'success': '\033[92m',
+    'warning': '\033[93m',
+    'error': '\033[91m',
 }
 
 @contextmanager
@@ -861,6 +868,12 @@ class Connection:
     
     def key(self) -> str:
         return f"{self.local_ip}:{self.local_port}-{self.remote_ip}:{self.remote_port}-{self.state}"
+    
+    def local_address(self) -> str:
+        return f"{self.local_ip}:{self.local_port}"
+    
+    def remote_address(self) -> str:
+        return f"{self.remote_ip}:{self.remote_port}"
 
 @dataclass
 class CacheEntry:
@@ -1250,32 +1263,60 @@ class OutputFormatter:
     @staticmethod
     def format_table(connections: List[Connection], show_process: bool = False, use_colors: bool = True) -> str:
         if not connections:
-            return "No connections found.\n"
+            return OutputFormatter._colorize("No connections found.\n", 'info', use_colors)
         
         connections.sort(key=lambda x: (x.local_port, x.proto, x.state))
-        output = "\nACTIVE TCP CONNECTIONS:\n"
+        
+        lines = []
+        lines.append(OutputFormatter._colorize("\nACTIVE TCP CONNECTIONS", 'header', use_colors))
+        lines.append("")
         
         if show_process:
-            output += f"{'Proto':<5} {'State':<15} {'Local Address':<25} {'Remote Address':<25} {'Process':<30}\n"
-            output += "-" * 105 + "\n"
+            header = f"{'Proto':<5} {'State':<15} {'Local Address':<25} {'Remote Address':<25} {'Process':<30}"
+            lines.append(OutputFormatter._colorize(header, 'bold', use_colors))
+            lines.append(OutputFormatter._colorize("-" * 105, 'info', use_colors))
             
             for conn in connections:
-                color = COLORS.get(conn.state, '') if use_colors else ''
-                reset = COLORS['reset'] if use_colors else ''
+                state_colored = OutputFormatter._colorize_state(conn.state, use_colors)
                 process = conn.process or '[unknown]'
-                output += f"{conn.proto:<5} {color}{conn.state:<15}{reset} {conn.local_ip}:{conn.local_port:<25} {conn.remote_ip}:{conn.remote_port:<25} {process[:30]:<30}\n"
+                line = (
+                    f"{conn.proto:<5} {state_colored:<15} "
+                    f"{conn.local_address():<25} {conn.remote_address():<25} "
+                    f"{process[:30]:<30}"
+                )
+                lines.append(line)
         else:
-            output += f"{'Proto':<5} {'State':<15} {'Local Address':<25} {'Remote Address':<25}\n"
-            output += "-" * 75 + "\n"
+            header = f"{'Proto':<5} {'State':<15} {'Local Address':<25} {'Remote Address':<25}"
+            lines.append(OutputFormatter._colorize(header, 'bold', use_colors))
+            lines.append(OutputFormatter._colorize("-" * 75, 'info', use_colors))
             
             for conn in connections:
-                color = COLORS.get(conn.state, '') if use_colors else ''
-                reset = COLORS['reset'] if use_colors else ''
-                output += f"{conn.proto:<5} {color}{conn.state:<15}{reset} {conn.local_ip}:{conn.local_port:<25} {conn.remote_ip}:{conn.remote_port:<25}\n"
+                state_colored = OutputFormatter._colorize_state(conn.state, use_colors)
+                line = (
+                    f"{conn.proto:<5} {state_colored:<15} "
+                    f"{conn.local_address():<25} {conn.remote_address():<25}"
+                )
+                lines.append(line)
         
+        lines.append("")
         stats = OutputFormatter._get_connection_stats(connections)
-        output += OutputFormatter._format_summary(stats, use_colors)
-        return output
+        lines.append(OutputFormatter._format_summary(stats, use_colors))
+        
+        return "\n".join(lines) + "\n"
+    
+    @staticmethod
+    def _colorize(text: str, color_name: str, use_colors: bool) -> str:
+        if not use_colors or color_name not in COLORS:
+            return text
+        return f"{COLORS[color_name]}{text}{COLORS['reset']}"
+    
+    @staticmethod
+    def _colorize_state(state: str, use_colors: bool) -> str:
+        if not use_colors:
+            return state
+        color = COLORS.get(state, '')
+        reset = COLORS['reset']
+        return f"{color}{state}{reset}" if color else state
     
     @staticmethod
     def format_json(connections: List[Connection], include_stats: bool = False) -> str:
@@ -1298,44 +1339,52 @@ class OutputFormatter:
         if not connections:
             return ""
         
-        output = "Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode\n"
+        lines = []
+        lines.append("Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode")
         
         for conn in connections:
             process = conn.process.replace('"', '""')
             if any(c in process for c in [',', '"', '\n', '\r']):
                 process = f'"{process}"'
             
-            output += f"{conn.proto},{conn.state},{conn.local_ip},{conn.local_port},{conn.remote_ip},{conn.remote_port},{process},{conn.inode}\n"
+            line = (
+                f"{conn.proto},{conn.state},{conn.local_ip},{conn.local_port},"
+                f"{conn.remote_ip},{conn.remote_port},{process},{conn.inode}"
+            )
+            lines.append(line)
         
-        return output
+        return "\n".join(lines) + "\n"
     
     @staticmethod
     def format_statistics(connections: List[Connection], use_colors: bool = True) -> str:
         stats = OutputFormatter._get_connection_stats(connections)
-        output = "\nDETAILED TCP CONNECTION STATISTICS\n"
-        output += "=" * 50 + "\n"
-        output += f"Generated at: {stats['timestamp']}\n"
-        output += f"Total connections: {stats['total']}\n"
-        output += f"IPv4 connections: {stats['ipv4']}\n"
-        output += f"IPv6 connections: {stats['ipv6']}\n\n"
         
-        output += "Connections by State:\n"
-        output += "-" * 30 + "\n"
+        lines = []
+        lines.append(OutputFormatter._colorize("\nDETAILED TCP CONNECTION STATISTICS", 'header', use_colors))
+        lines.append(OutputFormatter._colorize("=" * 50, 'info', use_colors))
+        lines.append(f"Generated at: {stats['timestamp']}")
+        lines.append(f"Total connections: {stats['total']}")
+        lines.append(f"IPv4 connections: {stats['ipv4']}")
+        lines.append(f"IPv6 connections: {stats['ipv6']}")
+        lines.append("")
+        
+        lines.append(OutputFormatter._colorize("Connections by State:", 'bold', use_colors))
+        lines.append(OutputFormatter._colorize("-" * 30, 'info', use_colors))
         for state, count in sorted(stats['by_state'].items()):
-            color = COLORS.get(state, '') if use_colors else ''
-            reset = COLORS['reset'] if use_colors else ''
-            output += f"{color}{state:<20}{reset}: {count}\n"
+            state_colored = OutputFormatter._colorize_state(state, use_colors)
+            lines.append(f"{state_colored:<20}: {count}")
         
         if stats['by_process']:
-            output += "\nConnections by Process (Top 10):\n"
-            output += "-" * 50 + "\n"
+            lines.append("")
+            lines.append(OutputFormatter._colorize("Connections by Process (Top 10):", 'bold', use_colors))
+            lines.append(OutputFormatter._colorize("-" * 50, 'info', use_colors))
             
             sorted_processes = sorted(stats['by_process'].items(), key=lambda x: x[1], reverse=True)
             for process, count in sorted_processes[:10]:
                 if process and process != '[unknown]':
-                    output += f"{process:<40}: {count}\n"
+                    lines.append(f"{process:<40}: {count}")
         
-        return output
+        return "\n".join(lines) + "\n"
     
     @staticmethod
     def _get_connection_stats(connections: List[Connection]) -> dict:
@@ -1363,18 +1412,21 @@ class OutputFormatter:
     
     @staticmethod
     def _format_summary(stats: dict, use_colors: bool = True) -> str:
-        output = f"\nSummary: {stats['total']} total connections ({stats['ipv4']} IPv4, {stats['ipv6']} IPv6)\n"
+        summary = f"Summary: {stats['total']} total connections ({stats['ipv4']} IPv4, {stats['ipv6']} IPv6)"
         
         if stats['by_state']:
-            output += "By state: "
+            summary += " | By state: "
             state_strings = []
             for state, count in sorted(stats['by_state'].items()):
-                color = COLORS.get(state, '') if use_colors else ''
-                reset = COLORS['reset'] if use_colors else ''
-                state_strings.append(f"{color}{state}{reset}: {count}")
-            output += ", ".join(state_strings) + "\n"
+                if use_colors:
+                    color = COLORS.get(state, '')
+                    reset = COLORS['reset']
+                    state_strings.append(f"{color}{state}{reset}: {count}" if color else f"{state}: {count}")
+                else:
+                    state_strings.append(f"{state}: {count}")
+            summary += ", ".join(state_strings)
         
-        return output
+        return OutputFormatter._colorize(summary, 'success', use_colors)
     
     @staticmethod
     def strip_colors(text: str) -> str:
@@ -1565,12 +1617,12 @@ class ConnectionWatcher:
         iteration = 0
         SignalHandler.init()
         
-        print(f"Watching TCP connections (refresh every {interval}s). Press Ctrl+C to stop.")
-        print(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        print(f"\n{COLORS['bold']}Watching TCP connections{COLORS['reset']} (refresh every {interval}s). Press Ctrl+C to stop.")
+        print(f"Started at: {COLORS['info']}{time.strftime('%Y-%m-%d %H:%M:%S')}{COLORS['reset']}\n")
         
         while not SignalHandler.should_exit():
             iteration += 1
-            print("\033[2J\033[;H", end='')
+            print(f"{COLORS['bold']}\033[2J\033[;H{COLORS['reset']}", end='')
             
             connections = self.monitor.get_connections()
             
@@ -1580,12 +1632,13 @@ class ConnectionWatcher:
                 added = len(changes['added'])
                 removed = len(changes['removed'])
                 if added or removed:
-                    print(f"Changes: +{added} -{removed}")
+                    change_color = 'success' if added > removed else 'warning'
+                    print(f"{COLORS[change_color]}Changes: +{added} -{removed}{COLORS['reset']}")
                 else:
-                    print("No changes")
+                    print(f"{COLORS['info']}No changes{COLORS['reset']}")
             
-            print(f"[{time.strftime('%H:%M:%S')}] Iteration: {iteration} | Connections: {len(connections)}")
-            print("-" * 60)
+            print(f"{COLORS['header']}[{time.strftime('%H:%M:%S')}] Iteration: {iteration} | Connections: {len(connections)}{COLORS['reset']}")
+            print(f"{COLORS['info']}{'-' * 60}{COLORS['reset']}")
             
             if options.get('json'):
                 print(OutputFormatter.format_json(connections, options.get('stats', False)), end='')
@@ -1650,11 +1703,11 @@ def display_performance_metrics(options):
         process_stats = ProcessCache.get_stats()
         connection_stats = ConnectionCache.get_stats()
         
-        print("\nPerformance:")
-        print(f"  Time: {metrics['execution_time']}s")
-        print(f"  Memory: {metrics['memory_peak_mb']} KB")
-        print(f"  Process cache: {process_stats['cache_size']} entries, {process_stats['hit_rate']}% hits")
-        print(f"  Connection cache: {connection_stats['cache_entries']} entries, {connection_stats['hit_rate']}% hits")
+        print(f"\n{COLORS['bold']}Performance:{COLORS['reset']}")
+        print(f"  Time: {COLORS['info']}{metrics['execution_time']}s{COLORS['reset']}")
+        print(f"  Memory: {COLORS['info']}{metrics['memory_peak_mb']} MB{COLORS['reset']}")
+        print(f"  Process cache: {COLORS['info']}{process_stats['cache_size']}{COLORS['reset']} entries, {COLORS['success']}{process_stats['hit_rate']}%{COLORS['reset']} hits")
+        print(f"  Connection cache: {COLORS['info']}{connection_stats['cache_entries']}{COLORS['reset']} entries, {COLORS['success']}{connection_stats['hit_rate']}%{COLORS['reset']} hits")
 
 def cleanup():
     TempFileRegistry.cleanup()
@@ -1673,7 +1726,7 @@ def main():
         options = parse_arguments()
         
         if options.version:
-            print("TCP Monitor v1.0")
+            print(f"{COLORS['bold']}TCP Monitor v1.0{COLORS['reset']}")
             return 0
         
         config = Config()
@@ -1729,7 +1782,7 @@ def main():
             if options.csv or not options.json:
                 output = OutputFormatter.strip_colors(output)
             Exporter.to_file_with_backup(output, options.output)
-            print(f"Output written to: {options.output}")
+            print(f"{COLORS['success']}Output written to: {options.output}{COLORS['reset']}")
         else:
             print(output, end='')
         
