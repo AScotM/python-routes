@@ -137,11 +137,18 @@ class Config:
         'retry_base_delay': ConfigEntry(0.1, 0.01, 5.0, float),
     }
 
+    @classmethod
+    def _clone_defaults(cls) -> Dict[str, ConfigEntry]:
+        return {
+            k: ConfigEntry(v.value, v.min_value, v.max_value, v.value_type)
+            for k, v in cls._defaults.items()
+        }
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             with cls._instance._lock:
-                cls._instance._config = cls._defaults.copy()
+                cls._instance._config = cls._clone_defaults()
         return cls._instance
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -239,13 +246,17 @@ class Config:
 
     def validate_required(self) -> None:
         required_keys = ['refresh_interval', 'max_cache_size', 'file_operation_timeout']
+        missing = []
         for key in required_keys:
-            if key not in self._config:
-                raise ConfigError(f"Missing required config: {key}")
+            with self._lock:
+                if key not in self._config:
+                    missing.append(key)
+        if missing:
+            raise ConfigError(f"Missing required config: {', '.join(missing)}")
 
     def reload(self) -> None:
         with self._lock:
-            self._config = self._defaults.copy()
+            self._config = self._clone_defaults()
         self.load_from_env()
 
 
@@ -316,12 +327,14 @@ class Logger:
     def _setup_logger(self) -> None:
         self.logger = logging.getLogger('tcp_monitor')
         self.logger.setLevel(self._log_level)
+        self.logger.propagate = False
 
-        console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setFormatter(
-            logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
-        )
-        self.logger.addHandler(console_handler)
+        if not self.logger.handlers:
+            console_handler = logging.StreamHandler(sys.stderr)
+            console_handler.setFormatter(
+                logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+            )
+            self.logger.addHandler(console_handler)
 
     def set_log_level(self, level: str) -> None:
         level = level.upper()
@@ -766,9 +779,9 @@ class FileReader:
     _max_handles = 10
 
     @classmethod
-    def read(cls, path: str, timeout: int = 5) -> Optional[str]:
+    def read(cls, path: str, timeout_seconds: int = 5) -> Optional[str]:
         try:
-            with timeout(timeout):
+            with timeout(timeout_seconds):
                 with open(path, 'r') as f:
                     return f.read()
         except TimeoutError:
@@ -782,9 +795,9 @@ class FileReader:
             return None
 
     @classmethod
-    def read_mmap(cls, path: str, timeout: int = 5) -> Optional[str]:
+    def read_mmap(cls, path: str, timeout_seconds: int = 5) -> Optional[str]:
         try:
-            with timeout(timeout):
+            with timeout(timeout_seconds):
                 with open(path, 'rb') as f:
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                         return mm.read().decode('ascii', errors='ignore')
@@ -953,7 +966,7 @@ class Connection:
     timestamp: int = field(default_factory=lambda: int(time.time()))
 
     def key(self) -> str:
-        return f"{self.local_ip}:{self.local_port}-{self.remote_ip}:{self.remote_port}-{self.state}"
+        return f"{self.proto}-{self.local_ip}:{self.local_port}-{self.remote_ip}:{self.remote_port}-{self.state}-{self.inode}"
 
     def local_address(self) -> str:
         return f"{self.local_ip}:{self.local_port}"
@@ -978,6 +991,7 @@ class ProcessCache:
     _misses = 0
     _last_scan = 0
     _lock = threading.RLock()
+    _build_condition = threading.Condition(_lock)
     _max_cache_size = Config().get('max_cache_entries', 10000)
 
     @classmethod
@@ -992,19 +1006,12 @@ class ProcessCache:
 
             if cls._building:
                 timeout = Config().get('cache_rebuild_lock_timeout', 30)
-                end_time = time.time() + timeout
-
-                while cls._building and time.time() < end_time:
-                    cls._lock.release()
-                    try:
-                        time.sleep(0.1)
-                    finally:
-                        cls._lock.acquire()
-
+                cls._build_condition.wait(timeout)
+                
                 if cls._building:
                     Logger.get_instance().warning("Process cache rebuild timed out")
                     return cls._cache.copy() if cls._cache else {}
-
+                
                 if cls._cache and (now - cls._last_build) <= ttl:
                     return cls._cache.copy()
 
@@ -1036,6 +1043,7 @@ class ProcessCache:
                 return cls._cache.copy() if cls._cache else {}
             finally:
                 cls._building = False
+                cls._build_condition.notify_all()
 
     @classmethod
     def _build_process_map_fast(cls) -> Dict[int, str]:
