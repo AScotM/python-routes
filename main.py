@@ -309,6 +309,7 @@ class Logger:
     _BUFFER_SIZE = 100
     _file_handler: Optional[RotatingFileHandler] = None
     _lock = threading.RLock()
+    _cleanup_done = False
 
     LEVELS = {
         'DEBUG': logging.DEBUG,
@@ -355,9 +356,11 @@ class Logger:
 
         self._file_handler = RotatingFileHandler(filepath, max_bytes, backup_count)
 
-        for handler in self.logger.handlers[:]:
-            if isinstance(handler, logging.FileHandler):
-                self.logger.removeHandler(handler)
+        file_handlers = [h for h in self.logger.handlers 
+                        if isinstance(h, logging.FileHandler) or 
+                        hasattr(h, 'rotating_handler')]
+        for handler in file_handlers:
+            self.logger.removeHandler(handler)
 
         class RotatingFileLogHandler(logging.Handler):
             def __init__(self, rotating_handler: RotatingFileHandler):
@@ -741,6 +744,7 @@ class TempFileRegistry:
     _files = []
     _lock = threading.RLock()
     _max_files = 1000
+    _cleanup_done = False
 
     @classmethod
     def register(cls, filepath: str) -> None:
@@ -756,12 +760,15 @@ class TempFileRegistry:
     @classmethod
     def cleanup(cls) -> None:
         with cls._lock:
+            if cls._cleanup_done:
+                return
             for filepath in cls._files:
                 try:
                     os.unlink(filepath)
                 except OSError:
                     pass
             cls._files.clear()
+            cls._cleanup_done = True
 
     @classmethod
     def get_registered_files(cls) -> list:
@@ -1006,7 +1013,13 @@ class ProcessCache:
 
             if cls._building:
                 timeout = Config().get('cache_rebuild_lock_timeout', 30)
-                cls._build_condition.wait(timeout)
+                end_time = time.time() + timeout
+                
+                while cls._building and time.time() < end_time:
+                    remaining = end_time - time.time()
+                    if remaining <= 0:
+                        break
+                    cls._build_condition.wait(min(0.1, remaining))
                 
                 if cls._building:
                     Logger.get_instance().warning("Process cache rebuild timed out")
@@ -1668,6 +1681,7 @@ class SignalHandler:
     _initialized = False
     _cleanup_functions = []
     _lock = threading.RLock()
+    _cleanup_done = False
 
     @classmethod
     def init(cls) -> None:
@@ -1703,11 +1717,15 @@ class SignalHandler:
 
     @classmethod
     def _cleanup(cls) -> None:
-        for func in cls._cleanup_functions:
-            try:
-                func()
-            except Exception:
-                pass
+        with cls._lock:
+            if cls._cleanup_done:
+                return
+            for func in cls._cleanup_functions:
+                try:
+                    func()
+                except Exception:
+                    pass
+            cls._cleanup_done = True
 
 
 class TCPConnectionMonitor:
@@ -1856,6 +1874,18 @@ def cleanup() -> None:
     TempFileRegistry.cleanup()
     FileReader.close_all()
     Logger.get_instance().info("Cleanup completed")
+
+
+def verify_ipv6_decoding() -> None:
+    test_cases = [
+        ("00000000000000000000000000000000", "::"),
+        ("00000000000000000000000001000000", "::1"),
+        ("FE800000000000000200000000000000", "fe80::2:0:0:0"),
+        ("20010DB8000000000000000000000001", "2001:db8::1"),
+    ]
+    for hex_str, expected in test_cases:
+        result = IPUtils.hex_to_ipv6(hex_str)
+        print(f"hex_to_ipv6('{hex_str}') = '{result}' (expected '{expected}')")
 
 
 def main() -> int:
