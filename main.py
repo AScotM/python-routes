@@ -881,9 +881,16 @@ class IPUtils:
         hex_str = hex_str.strip()
         if len(hex_str) != 8:
             return '0.0.0.0'
-
+        
         try:
-            ip_int = int(hex_str, 16)
+            bytes_list = []
+            for i in range(0, 8, 2):
+                byte = hex_str[i:i+2]
+                bytes_list.append(byte)
+            
+            bytes_list.reverse()
+            reversed_hex = ''.join(bytes_list)
+            ip_int = int(reversed_hex, 16)
             return str(ipaddress.IPv4Address(ip_int))
         except (ValueError, TypeError):
             return '0.0.0.0'
@@ -893,18 +900,32 @@ class IPUtils:
         hex_str = hex_str.strip()
         if len(hex_str) != 32:
             return '::'
-
+        
         try:
             parts = []
             for i in range(0, 32, 8):
                 part = hex_str[i:i+8]
                 parts.append(part)
-
+            
             ipv6_parts = []
             for part in parts:
-                ipv6_parts.extend([part[j:j+4] for j in range(0, 8, 4)])
-
-            packed = bytes.fromhex(''.join(ipv6_parts))
+                bytes_list = []
+                for j in range(0, 8, 2):
+                    bytes_list.append(part[j:j+2])
+                bytes_list.reverse()
+                reversed_part = ''.join(bytes_list)
+                ipv6_parts.append(reversed_part)
+            
+            ipv6_parts.reverse()
+            
+            ipv6_groups = []
+            for part in ipv6_parts:
+                group1 = part[0:4]
+                group2 = part[4:8]
+                ipv6_groups.append(group1)
+                ipv6_groups.append(group2)
+            
+            packed = bytes.fromhex(''.join(ipv6_groups))
             return str(ipaddress.IPv6Address(packed))
         except (ValueError, TypeError):
             return '::'
