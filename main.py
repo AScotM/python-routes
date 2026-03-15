@@ -403,23 +403,19 @@ class Security:
             return False
 
         try:
-            if os.path.islink(path):
-                real_path = os.path.realpath(path)
-                if not real_path.startswith('/proc/'):
-                    return False
-                path = real_path
-
-            normalized = os.path.normpath(path)
-            proc_path = os.path.realpath('/proc')
-            
-            common = os.path.commonpath([normalized])
-            proc_common = os.path.commonpath([proc_path])
-            
-            if common == proc_common or normalized.startswith(proc_path + os.sep):
-                pass
-            else:
+            real_path = os.path.realpath(path)
+            if not real_path.startswith('/proc/'):
                 return False
-
+            
+            normalized = os.path.normpath(real_path)
+            
+            parts = normalized.split('/')
+            if '..' in parts or '.' in parts:
+                return False
+                
+            if not normalized.startswith('/proc/'):
+                return False
+                
         except (OSError, ValueError):
             return False
 
@@ -919,9 +915,15 @@ class IPUtils:
             return '::'
         
         try:
-            hex_str = hex_str.zfill(32)[:32]
-            bytes_addr = bytes.fromhex(hex_str)
-            return str(ipaddress.IPv6Address(bytes_addr))
+            byte_pairs = [hex_str[i:i+2] for i in range(0, 32, 2)]
+            
+            byte_pairs.reverse()
+            
+            reversed_hex = ''.join(byte_pairs)
+            
+            ip_int = int(reversed_hex, 16)
+            
+            return str(ipaddress.IPv6Address(ip_int))
         except (ValueError, TypeError, ipaddress.AddressValueError):
             return '::'
 
@@ -1856,6 +1858,8 @@ def verify_ipv6_decoding() -> None:
         ("00000000000000000000000001000000", "::1"),
         ("FE800000000000000200000000000000", "fe80::2:0:0:0"),
         ("20010DB8000000000000000000000001", "2001:db8::1"),
+        ("00000000000000000000000000000001", "::1"),
+        ("20010db8000000000000000000000001", "2001:db8::1"),
     ]
     for hex_str, expected in test_cases:
         result = IPUtils.hex_to_ipv6(hex_str)
