@@ -915,13 +915,19 @@ class IPUtils:
             return '::'
         
         try:
-            byte_pairs = [hex_str[i:i+2] for i in range(0, 32, 2)]
+            groups = [hex_str[i:i+8] for i in range(0, 32, 8)]
             
-            byte_pairs.reverse()
+            converted_parts = []
+            for group in groups:
+                bytes_list = [group[i:i+2] for i in range(0, 8, 2)]
+                bytes_list.reverse()
+                converted_parts.append(''.join(bytes_list))
             
-            reversed_hex = ''.join(byte_pairs)
+            converted_parts.reverse()
             
-            ip_int = int(reversed_hex, 16)
+            final_hex = ''.join(converted_parts)
+            
+            ip_int = int(final_hex, 16)
             
             return str(ipaddress.IPv6Address(ip_int))
         except (ValueError, TypeError, ipaddress.AddressValueError):
@@ -1852,18 +1858,32 @@ def cleanup() -> None:
     FileReader.close_all()
     Logger.get_instance().info("Cleanup completed")
 
-def verify_ipv6_decoding() -> None:
+def test_ipv6_decoding() -> None:
     test_cases = [
         ("00000000000000000000000000000000", "::"),
         ("00000000000000000000000001000000", "::1"),
-        ("FE800000000000000200000000000000", "fe80::2:0:0:0"),
+        ("0000000000000000FFFF000001000000", "::ffff:1.0.0.0"),
+        ("FE800000000000000200000000000000", "fe80::2"),
         ("20010DB8000000000000000000000001", "2001:db8::1"),
         ("00000000000000000000000000000001", "::1"),
-        ("20010db8000000000000000000000001", "2001:db8::1"),
+        ("00000000000000000000000000000000", "::"),
+        ("FFFF0000000000000000000000000000", "ffff::"),
     ]
+    
+    print("Testing IPv6 decoding:")
+    print("-" * 50)
+    all_passed = True
     for hex_str, expected in test_cases:
         result = IPUtils.hex_to_ipv6(hex_str)
-        print(f"hex_to_ipv6('{hex_str}') = '{result}' (expected '{expected}')")
+        passed = result == expected
+        status = "✓" if passed else "✗"
+        print(f"{status} hex_to_ipv6('{hex_str}') = '{result}' (expected '{expected}')")
+        if not passed:
+            all_passed = False
+    
+    print("-" * 50)
+    print(f"Overall: {'PASSED' if all_passed else 'FAILED'}")
+    return all_passed
 
 def main() -> int:
     try:
@@ -1905,6 +1925,9 @@ def main() -> int:
 
         SignalHandler.init()
         SignalHandler.register_cleanup(cleanup)
+
+        if 'test_ipv6' in sys.argv:
+            return 0 if test_ipv6_decoding() else 1
 
         monitor = TCPConnectionMonitor(vars(options))
 
