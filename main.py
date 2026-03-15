@@ -72,7 +72,6 @@ COLORS = {
     'error': '\033[91m',
 }
 
-
 @contextmanager
 def timeout(seconds: int):
     def timeout_handler(signum, frame):
@@ -86,10 +85,8 @@ def timeout(seconds: int):
         signal.alarm(0)
         signal.signal(signal.SIGALRM, original_handler)
 
-
 class ConfigError(Exception):
     pass
-
 
 @dataclass
 class ConfigEntry:
@@ -97,7 +94,6 @@ class ConfigEntry:
     min_value: Optional[Union[int, float]] = None
     max_value: Optional[Union[int, float]] = None
     value_type: type = str
-
 
 class Config:
     _instance = None
@@ -259,7 +255,6 @@ class Config:
             self._config = self._clone_defaults()
         self.load_from_env()
 
-
 class RotatingFileHandler:
     def __init__(self, filename: str, max_bytes: int = 10485760, backup_count: int = 5):
         self.filename = filename
@@ -274,32 +269,32 @@ class RotatingFileHandler:
             os.makedirs(log_dir, exist_ok=True)
 
     def _rotate(self) -> None:
-        if not os.path.exists(self.filename):
-            return
+        with self._lock:
+            if not os.path.exists(self.filename):
+                return
 
-        if os.path.getsize(self.filename) < self.max_bytes:
-            return
+            if os.path.getsize(self.filename) < self.max_bytes:
+                return
 
-        for i in range(self.backup_count - 1, 0, -1):
-            src = f"{self.filename}.{i}"
-            dst = f"{self.filename}.{i + 1}"
-            if os.path.exists(src):
+            for i in range(self.backup_count - 1, 0, -1):
+                src = f"{self.filename}.{i}"
+                dst = f"{self.filename}.{i + 1}"
+                if os.path.exists(src):
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    os.rename(src, dst)
+
+            if os.path.exists(self.filename):
+                dst = f"{self.filename}.1"
                 if os.path.exists(dst):
                     os.remove(dst)
-                os.rename(src, dst)
-
-        if os.path.exists(self.filename):
-            dst = f"{self.filename}.1"
-            if os.path.exists(dst):
-                os.remove(dst)
-            os.rename(self.filename, dst)
+                os.rename(self.filename, dst)
 
     def write(self, content: str) -> None:
         with self._lock:
             self._rotate()
             with open(self.filename, 'a') as f:
                 f.write(content + '\n')
-
 
 class Logger:
     _instance = None
@@ -401,7 +396,6 @@ class Logger:
             cls._instance = cls()
         return cls._instance
 
-
 class Security:
     @staticmethod
     def validate_path(path: str) -> bool:
@@ -413,12 +407,17 @@ class Security:
                 real_path = os.path.realpath(path)
                 if not real_path.startswith('/proc/'):
                     return False
-                if os.path.commonpath([real_path, '/proc']) != '/proc':
-                    return False
                 path = real_path
 
             normalized = os.path.normpath(path)
-            if not normalized.startswith('/proc/'):
+            proc_path = os.path.realpath('/proc')
+            
+            common = os.path.commonpath([normalized])
+            proc_common = os.path.commonpath([proc_path])
+            
+            if common == proc_common or normalized.startswith(proc_path + os.sep):
+                pass
+            else:
                 return False
 
         except (OSError, ValueError):
@@ -532,7 +531,6 @@ class Security:
 
         return True
 
-
 class RateLimiter:
     _requests = deque()
     _last_cleanup = 0
@@ -566,7 +564,6 @@ class RateLimiter:
         with cls._lock:
             cls._max_requests = Config().get('rate_limit_requests', 100)
             cls._window = Config().get('rate_limit_window', 60)
-
 
 class PerformanceTracker:
     _start_time = time.time()
@@ -687,7 +684,6 @@ class PerformanceTracker:
                 except Exception:
                     pass
 
-
 class ErrorHandler:
     @staticmethod
     def handle_file_read(filepath: str) -> str:
@@ -739,7 +735,6 @@ class ErrorHandler:
 
         raise last_exception
 
-
 class TempFileRegistry:
     _files = []
     _lock = threading.RLock()
@@ -779,7 +774,6 @@ class TempFileRegistry:
     def set_max_files(cls, max_files: int) -> None:
         cls._max_files = max_files
 
-
 class FileReader:
     _handles = {}
     _lock = threading.RLock()
@@ -806,12 +800,17 @@ class FileReader:
         try:
             with timeout(timeout_seconds):
                 with open(path, 'rb') as f:
+                    file_size = os.fstat(f.fileno()).st_size
+                    if file_size == 0:
+                        return ""
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                        if mm.size() != file_size:
+                            raise RuntimeError("File size changed during read")
                         return mm.read().decode('ascii', errors='ignore')
         except TimeoutError:
             Logger.get_instance().debug(f"Timeout mmap reading {path}")
             return None
-        except (OSError, IOError, ValueError, mmap.error) as e:
+        except (OSError, IOError, ValueError, mmap.error, RuntimeError) as e:
             Logger.get_instance().debug(f"Failed to mmap read {path}: {e}")
             return None
         except Exception as e:
@@ -822,7 +821,6 @@ class FileReader:
     def close_all(cls) -> None:
         with cls._lock:
             cls._handles.clear()
-
 
 class InputValidator:
     @staticmethod
@@ -894,7 +892,6 @@ class InputValidator:
         max_pid = Config().get('max_pid', 4194304)
         return Security.validate_integer(pid, 1, max_pid)
 
-
 class IPUtils:
     @staticmethod
     def hex_to_ipv4(hex_str: str) -> str:
@@ -922,32 +919,10 @@ class IPUtils:
             return '::'
         
         try:
-            parts = []
-            for i in range(0, 32, 8):
-                part = hex_str[i:i+8]
-                parts.append(part)
-            
-            ipv6_parts = []
-            for part in parts:
-                bytes_list = []
-                for j in range(0, 8, 2):
-                    bytes_list.append(part[j:j+2])
-                bytes_list.reverse()
-                reversed_part = ''.join(bytes_list)
-                ipv6_parts.append(reversed_part)
-            
-            ipv6_parts.reverse()
-            
-            ipv6_groups = []
-            for part in ipv6_parts:
-                group1 = part[0:4]
-                group2 = part[4:8]
-                ipv6_groups.append(group1)
-                ipv6_groups.append(group2)
-            
-            packed = bytes.fromhex(''.join(ipv6_groups))
-            return str(ipaddress.IPv6Address(packed))
-        except (ValueError, TypeError):
+            hex_str = hex_str.zfill(32)[:32]
+            bytes_addr = bytes.fromhex(hex_str)
+            return str(ipaddress.IPv6Address(bytes_addr))
+        except (ValueError, TypeError, ipaddress.AddressValueError):
             return '::'
 
     @staticmethod
@@ -958,7 +933,6 @@ class IPUtils:
             return ip_obj in network
         except (ValueError, TypeError):
             return False
-
 
 @dataclass
 class Connection:
@@ -981,13 +955,11 @@ class Connection:
     def remote_address(self) -> str:
         return f"{self.remote_ip}:{self.remote_port}"
 
-
 @dataclass
 class CacheEntry:
     data: Any
     timestamp: float
     ttl: int = 300
-
 
 class ProcessCache:
     _cache: Dict[int, str] = {}
@@ -1002,11 +974,24 @@ class ProcessCache:
     _max_cache_size = Config().get('max_cache_entries', 10000)
 
     @classmethod
+    def _cleanup_old_entries(cls):
+        now = time.time()
+        max_age = Config().get('max_cache_age', 300)
+        with cls._lock:
+            to_delete = [k for k, v in cls._cache_timestamp.items() 
+                        if now - v > max_age]
+            for k in to_delete:
+                cls._cache.pop(k, None)
+                cls._cache_timestamp.pop(k, None)
+
+    @classmethod
     def get_process_map(cls) -> Dict[int, str]:
         now = time.time()
         ttl = Config().get('process_cache_ttl', 5)
 
         with cls._lock:
+            cls._cleanup_old_entries()
+
             if cls._cache and (now - cls._last_build) <= ttl and not cls._building:
                 cls._hits += 1
                 return cls._cache.copy()
@@ -1042,6 +1027,8 @@ class ProcessCache:
                     cls._cache = new_cache
                     cls._last_build = now
                     cls._last_scan = now
+                    for inode in new_cache:
+                        cls._cache_timestamp[inode] = now
 
                 if len(cls._cache) > cls._max_cache_size:
                     sorted_cache = sorted(
@@ -1126,7 +1113,6 @@ class ProcessCache:
                             for inode in inodes:
                                 if inode in inode_set:
                                     process_map[inode] = f"{process_name} (PID:{pid})"
-                                    cls._cache_timestamp[inode] = time.time()
                                     if len(process_map) >= len(inode_set):
                                         break
                 except TimeoutError:
@@ -1226,7 +1212,6 @@ class ProcessCache:
             'hit_rate': round(cls._hits / total * 100, 2) if total > 0 else 0,
             'building': cls._building
         }
-
 
 class ConnectionCache:
     _cache: Dict[tuple, CacheEntry] = {}
@@ -1390,7 +1375,6 @@ class ConnectionCache:
             'misses': cls._misses,
             'hit_rate': round(cls._hits / total * 100, 2) if total > 0 else 0
         }
-
 
 class OutputFormatter:
     @staticmethod
@@ -1573,7 +1557,6 @@ class OutputFormatter:
     def strip_colors(text: str) -> str:
         return re.sub(r'\033\[[0-9;]*m', '', text)
 
-
 class ConnectionFilter:
     @staticmethod
     def filter(connections: List[Connection], options: dict) -> List[Connection]:
@@ -1634,7 +1617,6 @@ class ConnectionFilter:
             return IPUtils.ip_in_cidr(ip, filter_str)
         return False
 
-
 class ConnectionHistory:
     _history = deque(maxlen=1000)
     _lock = threading.RLock()
@@ -1673,7 +1655,6 @@ class ConnectionHistory:
                 'history_size': len(cls._history),
                 'total_tracked': sum(len(h) for h in cls._history)
             }
-
 
 class SignalHandler:
     _should_exit = False
@@ -1727,7 +1708,6 @@ class SignalHandler:
                     pass
             cls._cleanup_done = True
 
-
 class TCPConnectionMonitor:
     def __init__(self, options: dict):
         self.options = options
@@ -1764,7 +1744,6 @@ class TCPConnectionMonitor:
                     break
 
         return ConnectionFilter.filter(connections, self.options)
-
 
 class ConnectionWatcher:
     def __init__(self, monitor: TCPConnectionMonitor):
@@ -1807,7 +1786,6 @@ class ConnectionWatcher:
                     break
                 time.sleep(1)
 
-
 class Exporter:
     @staticmethod
     def to_file(content: str, filename: str) -> None:
@@ -1824,7 +1802,6 @@ class Exporter:
             os.rename(filename, backup)
 
         Exporter.to_file(content, filename)
-
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Monitor TCP connections on Linux')
@@ -1856,7 +1833,6 @@ def parse_arguments() -> argparse.Namespace:
 
     return parser.parse_args()
 
-
 def display_performance_metrics(options: argparse.Namespace) -> None:
     if options.verbose or options.debug:
         metrics = PerformanceTracker.get_metrics()
@@ -1869,12 +1845,10 @@ def display_performance_metrics(options: argparse.Namespace) -> None:
         print(f"  Process cache: {COLORS['info']}{process_stats['cache_size']}{COLORS['reset']} entries, {COLORS['success']}{process_stats['hit_rate']}%{COLORS['reset']} hits")
         print(f"  Connection cache: {COLORS['info']}{connection_stats['cache_entries']}{COLORS['reset']} entries, {COLORS['success']}{connection_stats['hit_rate']}%{COLORS['reset']} hits")
 
-
 def cleanup() -> None:
     TempFileRegistry.cleanup()
     FileReader.close_all()
     Logger.get_instance().info("Cleanup completed")
-
 
 def verify_ipv6_decoding() -> None:
     test_cases = [
@@ -1886,7 +1860,6 @@ def verify_ipv6_decoding() -> None:
     for hex_str, expected in test_cases:
         result = IPUtils.hex_to_ipv6(hex_str)
         print(f"hex_to_ipv6('{hex_str}') = '{result}' (expected '{expected}')")
-
 
 def main() -> int:
     try:
@@ -1974,7 +1947,6 @@ def main() -> int:
         cleanup()
 
     return 0
-
 
 if __name__ == '__main__':
     sys.exit(main())
