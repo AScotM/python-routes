@@ -77,13 +77,15 @@ def timeout(seconds: int):
     def timeout_handler(signum, frame):
         raise TimeoutError(f"Operation timed out after {seconds} seconds")
 
-    original_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
+    original_handler = None
     try:
+        original_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(seconds)
         yield
     finally:
         signal.alarm(0)
-        signal.signal(signal.SIGALRM, original_handler)
+        if original_handler is not None:
+            signal.signal(signal.SIGALRM, original_handler)
 
 class ConfigError(Exception):
     pass
@@ -142,9 +144,10 @@ class Config:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            with cls._instance._lock:
-                cls._instance._config = cls._clone_defaults()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._config = cls._clone_defaults()
         return cls._instance
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -316,8 +319,10 @@ class Logger:
 
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._setup_logger()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._setup_logger()
         return cls._instance
 
     def _setup_logger(self) -> None:
@@ -564,6 +569,7 @@ class RateLimiter:
 class PerformanceTracker:
     _start_time = time.time()
     _memory_peak = 0
+    _max_memory = 0
     _operations = 0
     _memory_checks = []
     _timers = {}
@@ -577,6 +583,7 @@ class PerformanceTracker:
     def start(cls) -> None:
         cls._start_time = time.time()
         cls._memory_peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        cls._max_memory = cls._memory_peak
         cls._last_check = int(time.time())
         try:
             tracemalloc.start()
@@ -610,6 +617,8 @@ class PerformanceTracker:
         if cls._tracemalloc_started:
             try:
                 current, peak = tracemalloc.get_traced_memory()
+                if current > cls._max_memory:
+                    cls._max_memory = current
                 with cls._lock:
                     cls._memory_checks.append(
                         {'time': time.time(), 'current': current, 'peak': peak}
@@ -621,6 +630,7 @@ class PerformanceTracker:
                 critical_threshold = Config().get('memory_critical_threshold', 402653184)
 
                 if current > critical_threshold:
+                    cls._trigger_gc()
                     return False, current
                 elif current > warning_threshold:
                     return True, current
@@ -630,12 +640,20 @@ class PerformanceTracker:
         return True, 0
 
     @classmethod
+    def _trigger_gc(cls) -> None:
+        if not cls._gc_triggered:
+            import gc
+            gc.collect()
+            cls._gc_triggered = True
+
+    @classmethod
     def get_metrics(cls) -> dict:
         end_time = time.time()
         metrics = {
             'execution_time': round(end_time - cls._start_time, 4),
             'memory_peak_kb': cls._memory_peak,
             'memory_peak_mb': round(cls._memory_peak / 1024, 2),
+            'max_memory_mb': round(cls._max_memory / 1048576, 2) if cls._max_memory else 0,
             'operations': cls._operations,
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
@@ -799,6 +817,8 @@ class FileReader:
                     file_size = os.fstat(f.fileno()).st_size
                     if file_size == 0:
                         return ""
+                    if file_size > Config().get('max_file_size', 10485760):
+                        return None
                     with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
                         if mm.size() != file_size:
                             raise RuntimeError("File size changed during read")
@@ -968,6 +988,7 @@ class CacheEntry:
     data: Any
     timestamp: float
     ttl: int = 300
+    checksum: str = ''
 
 class ProcessCache:
     _cache: Dict[int, str] = {}
@@ -980,6 +1001,7 @@ class ProcessCache:
     _lock = threading.RLock()
     _build_condition = threading.Condition(_lock)
     _max_cache_size = Config().get('max_cache_entries', 10000)
+    _name_pattern = re.compile(r'Name:\s*(.+)')
 
     @classmethod
     def _cleanup_old_entries(cls):
@@ -1005,8 +1027,8 @@ class ProcessCache:
                 return cls._cache.copy()
 
             if cls._building:
-                timeout = Config().get('cache_rebuild_lock_timeout', 30)
-                end_time = time.time() + timeout
+                timeout_val = Config().get('cache_rebuild_lock_timeout', 30)
+                end_time = time.time() + timeout_val
                 
                 while cls._building and time.time() < end_time:
                     remaining = end_time - time.time()
@@ -1035,8 +1057,8 @@ class ProcessCache:
                     cls._cache = new_cache
                     cls._last_build = now
                     cls._last_scan = now
-                    for inode in new_cache:
-                        cls._cache_timestamp[inode] = now
+                    for pid in new_cache:
+                        cls._cache_timestamp[pid] = now
 
                 if len(cls._cache) > cls._max_cache_size:
                     sorted_cache = sorted(
@@ -1107,22 +1129,21 @@ class ProcessCache:
                             continue
 
                         with open(status_path, 'r') as f:
-                            status_content = f.read(1024)
+                            header = f.read(512)
+                            if skip_kernel and 'Kthread' in header:
+                                continue
 
-                        if skip_kernel and 'Kthread' in status_content:
-                            continue
-
-                        inodes = cls._get_process_inodes_fast(pid)
-
-                        if inodes:
-                            name_match = re.search(r'Name:\s*(.+)', status_content)
+                            name_match = cls._name_pattern.search(header)
                             process_name = name_match.group(1).strip() if name_match else f"PID:{pid}"
 
-                            for inode in inodes:
-                                if inode in inode_set:
-                                    process_map[inode] = f"{process_name} (PID:{pid})"
-                                    if len(process_map) >= len(inode_set):
-                                        break
+                            inodes = cls._get_process_inodes_fast(pid)
+
+                            if inodes:
+                                for inode in inodes:
+                                    if inode in inode_set:
+                                        process_map[inode] = f"{process_name} (PID:{pid})"
+                                        if len(process_map) >= len(inode_set):
+                                            break
                 except TimeoutError:
                     continue
                 except (OSError, IOError):
@@ -1169,6 +1190,7 @@ class ProcessCache:
     def _get_process_inodes_fast(cls, pid: int) -> Set[int]:
         inodes = set()
         fd_path = f"/proc/{pid}/fd"
+        max_fd_scan = Config().get('max_fd_per_process', 100)
 
         if not os.path.isdir(fd_path):
             return inodes
@@ -1178,12 +1200,16 @@ class ProcessCache:
         try:
             with timeout(timeout_seconds):
                 try:
-                    for fd in os.listdir(fd_path)[:100]:
+                    fd_count = 0
+                    for fd in os.listdir(fd_path):
+                        if fd_count >= max_fd_scan:
+                            break
                         try:
                             link = os.readlink(os.path.join(fd_path, fd))
                             match = re.search(r'socket:\[(\d+)\]', link)
                             if match:
                                 inodes.add(int(match.group(1)))
+                            fd_count += 1
                         except (OSError, IOError):
                             pass
                 except OSError:
@@ -1252,20 +1278,22 @@ class ConnectionCache:
             if cache_key in cls._cache:
                 entry = cls._cache[cache_key]
                 if now - entry.timestamp < max_age:
-                    cls._hits += 1
-                    return entry.data.copy()
-                else:
-                    del cls._cache[cache_key]
+                    if cls._validate_cache_entry(entry):
+                        cls._hits += 1
+                        return entry.data.copy()
+                    else:
+                        del cls._cache[cache_key]
 
             cls._misses += 1
 
             with PerformanceTracker.timer(f"read_{os.path.basename(filepath)}"):
-                connections = cls._read_connections_fast(filepath, family, include_process)
+                connections = cls._read_connections_stream(filepath, family, include_process, max_connections)
 
                 if len(connections) > max_connections:
                     connections = connections[:max_connections]
 
-                cls._cache[cache_key] = CacheEntry(connections, now)
+                checksum = cls._calculate_checksum(connections)
+                cls._cache[cache_key] = CacheEntry(connections, now, max_age, checksum)
 
                 if len(cls._cache) > Config().get('max_cache_size', 10000):
                     oldest = min(cls._cache.keys(), key=lambda k: cls._cache[k].timestamp)
@@ -1274,90 +1302,102 @@ class ConnectionCache:
             return connections.copy()
 
     @classmethod
-    def _read_connections_fast(
+    def _validate_cache_entry(cls, entry: CacheEntry) -> bool:
+        if not hasattr(entry, 'data') or not hasattr(entry, 'timestamp'):
+            return False
+        if not isinstance(entry.data, list):
+            return False
+        if entry.data and not isinstance(entry.data[0], Connection):
+            return False
+        current_checksum = cls._calculate_checksum(entry.data)
+        return current_checksum == entry.checksum
+
+    @classmethod
+    def _calculate_checksum(cls, connections: List[Connection]) -> str:
+        if not connections:
+            return ''
+        sample = connections[:10]
+        data = ''.join(c.key() for c in sample)
+        return str(hash(data) & 0xffffffff)
+
+    @classmethod
+    def _read_connections_stream(
         cls,
         filepath: str,
         family: int,
-        include_process: bool
+        include_process: bool,
+        max_connections: int
     ) -> List[Connection]:
         if not os.path.isfile(filepath) or not os.access(filepath, os.R_OK):
             return []
 
         connections = []
         process_map = ProcessCache.get_process_map() if include_process else {}
-
         timeout_seconds = Config().get('file_operation_timeout', 5)
 
         try:
             with timeout(timeout_seconds):
-                try:
-                    with open(filepath, 'rb') as f:
-                        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                            content = mm.read().decode('ascii', errors='ignore')
-                            lines = content.splitlines()
-                except (OSError, IOError, ValueError, mmap.error):
-                    with open(filepath, 'r') as f:
-                        lines = f.readlines()
-
-                if not lines:
-                    return []
-
-                for line in lines[1:]:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    fields = re.split(r'\s+', line)
-                    if len(fields) < 10:
-                        continue
-
-                    try:
-                        local_addr = fields[1]
-                        remote_addr = fields[2]
-
-                        local_parts = local_addr.split(':')
-                        remote_parts = remote_addr.split(':')
-
-                        if len(local_parts) != 2 or len(remote_parts) != 2:
+                with open(filepath, 'r') as f:
+                    next(f)
+                    for line in f:
+                        if len(connections) >= max_connections:
+                            break
+                        
+                        line = line.strip()
+                        if not line:
                             continue
 
-                        local_ip_hex = local_parts[0]
-                        local_port_hex = local_parts[1]
-                        remote_ip_hex = remote_parts[0]
-                        remote_port_hex = remote_parts[1]
+                        fields = re.split(r'\s+', line)
+                        if len(fields) < 10:
+                            continue
 
-                        if family == AF_INET:
-                            local_ip = IPUtils.hex_to_ipv4(local_ip_hex)
-                            remote_ip = IPUtils.hex_to_ipv4(remote_ip_hex)
-                        else:
-                            local_ip = IPUtils.hex_to_ipv6(local_ip_hex)
-                            remote_ip = IPUtils.hex_to_ipv6(remote_ip_hex)
+                        try:
+                            local_addr = fields[1]
+                            remote_addr = fields[2]
 
-                        local_port = int(local_port_hex, 16)
-                        remote_port = int(remote_port_hex, 16)
-                        state_code = fields[3].upper()
-                        state = TCP_STATES.get(state_code, f"UNKNOWN-{state_code}")
-                        proto = 'IPv4' if family == AF_INET else 'IPv6'
-                        inode = fields[9]
+                            local_parts = local_addr.split(':')
+                            remote_parts = remote_addr.split(':')
 
-                        process = ''
-                        if include_process and inode.isdigit():
-                            inode_int = int(inode)
-                            if inode_int in process_map:
-                                process = process_map[inode_int]
+                            if len(local_parts) != 2 or len(remote_parts) != 2:
+                                continue
 
-                        connections.append(Connection(
-                            proto=proto,
-                            state=state,
-                            local_ip=local_ip,
-                            local_port=local_port,
-                            remote_ip=remote_ip,
-                            remote_port=remote_port,
-                            inode=inode,
-                            process=process
-                        ))
-                    except (ValueError, IndexError):
-                        continue
+                            local_ip_hex = local_parts[0]
+                            local_port_hex = local_parts[1]
+                            remote_ip_hex = remote_parts[0]
+                            remote_port_hex = remote_parts[1]
+
+                            if family == AF_INET:
+                                local_ip = IPUtils.hex_to_ipv4(local_ip_hex)
+                                remote_ip = IPUtils.hex_to_ipv4(remote_ip_hex)
+                            else:
+                                local_ip = IPUtils.hex_to_ipv6(local_ip_hex)
+                                remote_ip = IPUtils.hex_to_ipv6(remote_ip_hex)
+
+                            local_port = int(local_port_hex, 16)
+                            remote_port = int(remote_port_hex, 16)
+                            state_code = fields[3].upper()
+                            state = TCP_STATES.get(state_code, f"UNKNOWN-{state_code}")
+                            proto = 'IPv4' if family == AF_INET else 'IPv6'
+                            inode = fields[9]
+
+                            process = ''
+                            if include_process and inode.isdigit():
+                                inode_int = int(inode)
+                                if inode_int in process_map:
+                                    process = process_map[inode_int]
+
+                            connections.append(Connection(
+                                proto=proto,
+                                state=state,
+                                local_ip=local_ip,
+                                local_port=local_port,
+                                remote_ip=remote_ip,
+                                remote_port=remote_port,
+                                inode=inode,
+                                process=process
+                            ))
+                        except (ValueError, IndexError):
+                            continue
         except TimeoutError:
             Logger.get_instance().debug(f"Timeout reading {filepath}")
             return []
@@ -1622,6 +1662,11 @@ class ConnectionFilter:
         if ip == filter_str:
             return True
         if '/' in filter_str:
+            parts = filter_str.split('/')
+            if len(parts) == 2 and parts[1].isdigit():
+                mask = int(parts[1])
+                if ('.' in ip and (mask < 0 or mask > 32)) or (':' in ip and (mask < 0 or mask > 128)):
+                    return False
             return IPUtils.ip_in_cidr(ip, filter_str)
         return False
 
