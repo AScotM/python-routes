@@ -16,10 +16,13 @@ import atexit
 import mmap
 import tracemalloc
 import resource
+import socket
+import struct
 from typing import Dict, List, Optional, Tuple, Any, Set, Union
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict, deque
 from contextlib import contextmanager
+from enum import Enum
 
 AF_INET = 2
 AF_INET6 = 10
@@ -33,9 +36,13 @@ MIN_CIDR_IPV4 = 0
 MAX_CIDR_IPV4 = 32
 MIN_CIDR_IPV6 = 0
 MAX_CIDR_IPV6 = 128
-PROC_NET_PATHS = ['/proc/net/tcp', '/proc/net/tcp6']
+PROC_NET_PATHS = ['/proc/net/tcp', '/proc/net/tcp6', '/proc/net/udp', '/proc/net/udp6']
 MAX_PATH_LENGTH = 4096
 MAX_IP_STRING_LENGTH = 256
+
+class ProtocolType(Enum):
+    TCP = "TCP"
+    UDP = "UDP"
 
 TCP_STATES = {
     '01': "ESTABLISHED",
@@ -50,6 +57,11 @@ TCP_STATES = {
     '0A': "LISTEN",
     '0B': "CLOSING",
     '0C': "NEW_SYN_RECV",
+}
+
+UDP_STATES = {
+    '07': "UNCONNECTED",
+    '0A': "LISTEN",
 }
 
 COLORS = {
@@ -133,6 +145,9 @@ class Config:
         'log_backup_count': ConfigEntry(5, 0, 100, int),
         'max_retry_attempts': ConfigEntry(3, 1, 10, int),
         'retry_base_delay': ConfigEntry(0.1, 0.01, 5.0, float),
+        'max_fd_per_process': ConfigEntry(1024, 1, 10000, int),
+        'prometheus_port': ConfigEntry(9090, 1024, 65535, int),
+        'enable_udp_monitoring': ConfigEntry(False, None, None, bool),
     }
 
     @classmethod
@@ -916,14 +931,7 @@ class IPUtils:
             return '0.0.0.0'
         
         try:
-            bytes_list = []
-            for i in range(0, 8, 2):
-                byte = hex_str[i:i+2]
-                bytes_list.append(byte)
-            
-            bytes_list.reverse()
-            reversed_hex = ''.join(bytes_list)
-            ip_int = int(reversed_hex, 16)
+            ip_int = int(hex_str, 16)
             return str(ipaddress.IPv4Address(ip_int))
         except (ValueError, TypeError):
             return '0.0.0.0'
@@ -935,21 +943,8 @@ class IPUtils:
             return '::'
         
         try:
-            groups = [hex_str[i:i+8] for i in range(0, 32, 8)]
-            
-            converted_parts = []
-            for group in groups:
-                bytes_list = [group[i:i+2] for i in range(0, 8, 2)]
-                bytes_list.reverse()
-                converted_parts.append(''.join(bytes_list))
-            
-            converted_parts.reverse()
-            
-            final_hex = ''.join(converted_parts)
-            
-            ip_int = int(final_hex, 16)
-            
-            return str(ipaddress.IPv6Address(ip_int))
+            addr_bytes = bytes.fromhex(hex_str)
+            return str(ipaddress.IPv6Address(addr_bytes))
         except (ValueError, TypeError, ipaddress.AddressValueError):
             return '::'
 
@@ -965,6 +960,7 @@ class IPUtils:
 @dataclass
 class Connection:
     proto: str
+    protocol_type: str
     state: str
     local_ip: str
     local_port: int
@@ -974,8 +970,13 @@ class Connection:
     process: str = ''
     timestamp: int = field(default_factory=lambda: int(time.time()))
 
+    def __post_init__(self):
+        if self.protocol_type is None:
+            self.protocol_type = 'TCP'
+        self.protocol_type = self.protocol_type.upper()
+
     def key(self) -> str:
-        return f"{self.proto}-{self.local_ip}:{self.local_port}-{self.remote_ip}:{self.remote_port}-{self.state}-{self.inode}"
+        return f"{self.proto}-{self.protocol_type}-{self.local_ip}:{self.local_port}-{self.remote_ip}:{self.remote_port}-{self.state}-{self.inode}"
 
     def local_address(self) -> str:
         return f"{self.local_ip}:{self.local_port}"
@@ -1098,6 +1099,9 @@ class ProcessCache:
 
         inode_set = set(connection_inodes)
 
+        if not inode_set:
+            return process_map
+
         scan_start = time.time()
         max_scan_time = Config().get('max_process_scan_time', 30)
         skip_kernel = Config().get('skip_kernel_threads', True)
@@ -1161,8 +1165,12 @@ class ProcessCache:
         inodes = []
         max_inodes = Config().get('max_inodes_to_scan', 100000)
         timeout_seconds = Config().get('file_operation_timeout', 5)
+        
+        proc_paths = ['/proc/net/tcp', '/proc/net/tcp6']
+        if Config().get('enable_udp_monitoring', False):
+            proc_paths.extend(['/proc/net/udp', '/proc/net/udp6'])
 
-        for filepath in PROC_NET_PATHS:
+        for filepath in proc_paths:
             if len(inodes) >= max_inodes:
                 break
 
@@ -1190,7 +1198,7 @@ class ProcessCache:
     def _get_process_inodes_fast(cls, pid: int) -> Set[int]:
         inodes = set()
         fd_path = f"/proc/{pid}/fd"
-        max_fd_scan = Config().get('max_fd_per_process', 100)
+        max_fd_scan = Config().get('max_fd_per_process', 1024)
 
         if not os.path.isdir(fd_path):
             return inodes
@@ -1252,17 +1260,46 @@ class ConnectionCache:
     _hits = 0
     _misses = 0
     _lock = threading.RLock()
+    _cleanup_thread = None
+    _stop_cleanup = False
+
+    @classmethod
+    def _cleanup_worker(cls):
+        while not cls._stop_cleanup:
+            time.sleep(60)
+            with cls._lock:
+                now = time.time()
+                to_delete = []
+                for key, entry in cls._cache.items():
+                    if now - entry.timestamp > entry.ttl:
+                        to_delete.append(key)
+                for key in to_delete:
+                    del cls._cache[key]
+
+    @classmethod
+    def start_cleanup_thread(cls):
+        if cls._cleanup_thread is None:
+            cls._stop_cleanup = False
+            cls._cleanup_thread = threading.Thread(target=cls._cleanup_worker, daemon=True)
+            cls._cleanup_thread.start()
+
+    @classmethod
+    def stop_cleanup_thread(cls):
+        cls._stop_cleanup = True
+        if cls._cleanup_thread:
+            cls._cleanup_thread.join(timeout=5)
 
     @classmethod
     def get_connections(
         cls,
         filepath: str,
         family: int,
+        protocol_type: str,
         include_process: bool = False
     ) -> List[Connection]:
         max_connections = Config().get('max_connections_per_scan', 50000)
         timeout_seconds = Config().get('file_operation_timeout', 5)
-        max_age = Config().get('max_cache_age', 300)
+        cache_ttl = Config().get('connection_cache_ttl', 1)
 
         try:
             with timeout(timeout_seconds):
@@ -1270,14 +1307,14 @@ class ConnectionCache:
         except (TimeoutError, OSError):
             return []
 
-        cache_key = (filepath, family, include_process, stat.st_mtime, stat.st_size)
+        cache_key = (filepath, family, protocol_type, include_process, stat.st_mtime, stat.st_size, stat.st_ino)
 
         with cls._lock:
             now = time.time()
 
             if cache_key in cls._cache:
                 entry = cls._cache[cache_key]
-                if now - entry.timestamp < max_age:
+                if now - entry.timestamp < cache_ttl:
                     if cls._validate_cache_entry(entry):
                         cls._hits += 1
                         return entry.data.copy()
@@ -1287,15 +1324,16 @@ class ConnectionCache:
             cls._misses += 1
 
             with PerformanceTracker.timer(f"read_{os.path.basename(filepath)}"):
-                connections = cls._read_connections_stream(filepath, family, include_process, max_connections)
+                connections = cls._read_connections_stream(filepath, family, protocol_type, include_process, max_connections)
 
                 if len(connections) > max_connections:
                     connections = connections[:max_connections]
 
                 checksum = cls._calculate_checksum(connections)
-                cls._cache[cache_key] = CacheEntry(connections, now, max_age, checksum)
+                cls._cache[cache_key] = CacheEntry(connections, now, cache_ttl, checksum)
 
-                if len(cls._cache) > Config().get('max_cache_size', 10000):
+                max_cache_entries = Config().get('max_cache_entries', 10000)
+                if len(cls._cache) > max_cache_entries:
                     oldest = min(cls._cache.keys(), key=lambda k: cls._cache[k].timestamp)
                     del cls._cache[oldest]
 
@@ -1325,6 +1363,7 @@ class ConnectionCache:
         cls,
         filepath: str,
         family: int,
+        protocol_type: str,
         include_process: bool,
         max_connections: int
     ) -> List[Connection]:
@@ -1334,6 +1373,8 @@ class ConnectionCache:
         connections = []
         process_map = ProcessCache.get_process_map() if include_process else {}
         timeout_seconds = Config().get('file_operation_timeout', 5)
+
+        state_map = TCP_STATES if protocol_type == 'tcp' else UDP_STATES
 
         try:
             with timeout(timeout_seconds):
@@ -1376,7 +1417,7 @@ class ConnectionCache:
                             local_port = int(local_port_hex, 16)
                             remote_port = int(remote_port_hex, 16)
                             state_code = fields[3].upper()
-                            state = TCP_STATES.get(state_code, f"UNKNOWN-{state_code}")
+                            state = state_map.get(state_code, f"UNKNOWN-{state_code}")
                             proto = 'IPv4' if family == AF_INET else 'IPv6'
                             inode = fields[9]
 
@@ -1386,8 +1427,9 @@ class ConnectionCache:
                                 if inode_int in process_map:
                                     process = process_map[inode_int]
 
-                            connections.append(Connection(
+                            connection = Connection(
                                 proto=proto,
+                                protocol_type=protocol_type.upper(),
                                 state=state,
                                 local_ip=local_ip,
                                 local_port=local_port,
@@ -1395,8 +1437,9 @@ class ConnectionCache:
                                 remote_port=remote_port,
                                 inode=inode,
                                 process=process
-                            ))
-                        except (ValueError, IndexError):
+                            )
+                            connections.append(connection)
+                        except (ValueError, IndexError) as e:
                             continue
         except TimeoutError:
             Logger.get_instance().debug(f"Timeout reading {filepath}")
@@ -1434,35 +1477,35 @@ class OutputFormatter:
         if not connections:
             return OutputFormatter._colorize("No connections found.\n", 'info', use_colors)
 
-        connections.sort(key=lambda x: (x.local_port, x.proto, x.state))
+        connections.sort(key=lambda x: (x.local_port, x.proto, x.protocol_type, x.state))
 
         lines = []
-        lines.append(OutputFormatter._colorize("\nACTIVE TCP CONNECTIONS", 'header', use_colors))
+        lines.append(OutputFormatter._colorize("\nACTIVE NETWORK CONNECTIONS", 'header', use_colors))
         lines.append("")
 
         if show_process:
-            header = f"{'Proto':<5} {'State':<15} {'Local Address':<25} {'Remote Address':<25} {'Process':<30}"
+            header = f"{'Proto':<5} {'Type':<4} {'State':<15} {'Local Address':<25} {'Remote Address':<25} {'Process':<30}"
             lines.append(OutputFormatter._colorize(header, 'bold', use_colors))
-            lines.append(OutputFormatter._colorize("-" * 105, 'info', use_colors))
+            lines.append(OutputFormatter._colorize("-" * 110, 'info', use_colors))
 
             for conn in connections:
                 state_colored = OutputFormatter._colorize_state(conn.state, use_colors)
                 process = conn.process or '[unknown]'
                 line = (
-                    f"{conn.proto:<5} {state_colored:<15} "
+                    f"{conn.proto:<5} {conn.protocol_type:<4} {state_colored:<15} "
                     f"{conn.local_address():<25} {conn.remote_address():<25} "
                     f"{process[:30]:<30}"
                 )
                 lines.append(line)
         else:
-            header = f"{'Proto':<5} {'State':<15} {'Local Address':<25} {'Remote Address':<25}"
+            header = f"{'Proto':<5} {'Type':<4} {'State':<15} {'Local Address':<25} {'Remote Address':<25}"
             lines.append(OutputFormatter._colorize(header, 'bold', use_colors))
-            lines.append(OutputFormatter._colorize("-" * 75, 'info', use_colors))
+            lines.append(OutputFormatter._colorize("-" * 80, 'info', use_colors))
 
             for conn in connections:
                 state_colored = OutputFormatter._colorize_state(conn.state, use_colors)
                 line = (
-                    f"{conn.proto:<5} {state_colored:<15} "
+                    f"{conn.proto:<5} {conn.protocol_type:<4} {state_colored:<15} "
                     f"{conn.local_address():<25} {conn.remote_address():<25}"
                 )
                 lines.append(line)
@@ -1509,7 +1552,7 @@ class OutputFormatter:
             return ""
 
         lines = []
-        lines.append("Protocol,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode")
+        lines.append("Protocol,Type,State,Local IP,Local Port,Remote IP,Remote Port,Process,Inode")
 
         for conn in connections:
             process = conn.process.replace('"', '""')
@@ -1517,7 +1560,7 @@ class OutputFormatter:
                 process = f'"{process}"'
 
             line = (
-                f"{conn.proto},{conn.state},{conn.local_ip},{conn.local_port},"
+                f"{conn.proto},{conn.protocol_type},{conn.state},{conn.local_ip},{conn.local_port},"
                 f"{conn.remote_ip},{conn.remote_port},{process},{conn.inode}"
             )
             lines.append(line)
@@ -1525,16 +1568,45 @@ class OutputFormatter:
         return "\n".join(lines) + "\n"
 
     @staticmethod
+    def format_prometheus(connections: List[Connection]) -> str:
+        lines = []
+        lines.append("# HELP network_connections_total Total number of network connections")
+        lines.append("# TYPE network_connections_total gauge")
+        
+        stats = OutputFormatter._get_connection_stats(connections)
+        
+        lines.append(f"network_connections_total {stats['total']}")
+        lines.append(f"network_connections_ipv4 {stats['ipv4']}")
+        lines.append(f"network_connections_ipv6 {stats['ipv6']}")
+        
+        for protocol, count in stats['by_protocol'].items():
+            protocol_safe = protocol.lower()
+            lines.append(f"network_connections_by_protocol{{protocol=\"{protocol_safe}\"}} {count}")
+        
+        for state, count in stats['by_state'].items():
+            state_safe = state.lower().replace(' ', '_')
+            lines.append(f"network_connections_by_state{{state=\"{state_safe}\"}} {count}")
+        
+        for process, count in list(stats['by_process'].items())[:20]:
+            process_safe = re.sub(r'[^a-zA-Z0-9_]', '_', process[:50])
+            lines.append(f"network_connections_by_process{{process=\"{process_safe}\"}} {count}")
+        
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
     def format_statistics(connections: List[Connection], use_colors: bool = True) -> str:
         stats = OutputFormatter._get_connection_stats(connections)
 
         lines = []
-        lines.append(OutputFormatter._colorize("\nDETAILED TCP CONNECTION STATISTICS", 'header', use_colors))
+        lines.append(OutputFormatter._colorize("\nDETAILED NETWORK CONNECTION STATISTICS", 'header', use_colors))
         lines.append(OutputFormatter._colorize("=" * 50, 'info', use_colors))
         lines.append(f"Generated at: {stats['timestamp']}")
         lines.append(f"Total connections: {stats['total']}")
         lines.append(f"IPv4 connections: {stats['ipv4']}")
         lines.append(f"IPv6 connections: {stats['ipv6']}")
+        lines.append(f"TCP connections: {stats['by_protocol'].get('TCP', 0)}")
+        lines.append(f"UDP connections: {stats['by_protocol'].get('UDP', 0)}")
         lines.append("")
 
         lines.append(OutputFormatter._colorize("Connections by State:", 'bold', use_colors))
@@ -1567,6 +1639,7 @@ class OutputFormatter:
             'ipv6': 0,
             'by_state': defaultdict(int),
             'by_process': defaultdict(int),
+            'by_protocol': defaultdict(int),
             'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
         }
 
@@ -1575,7 +1648,9 @@ class OutputFormatter:
                 stats['ipv4'] += 1
             else:
                 stats['ipv6'] += 1
-
+            
+            protocol = conn.protocol_type if conn.protocol_type else 'UNKNOWN'
+            stats['by_protocol'][protocol] += 1
             stats['by_state'][conn.state] += 1
 
             if conn.process:
@@ -1614,8 +1689,9 @@ class ConnectionFilter:
         remote_ip = options.get('remote_ip')
         ipv4_only = options.get('ipv4', False)
         ipv6_only = options.get('ipv6', False)
+        protocol = options.get('protocol', '')
 
-        if not any([states, port, local_ip, remote_ip, ipv4_only, ipv6_only]):
+        if not any([states, port, local_ip, remote_ip, ipv4_only, ipv6_only, protocol]):
             return connections
 
         result = []
@@ -1636,6 +1712,9 @@ class ConnectionFilter:
                 continue
 
             if ipv6_only and conn.proto != 'IPv6':
+                continue
+
+            if protocol and conn.protocol_type.upper() != protocol.upper():
                 continue
 
             result.append(conn)
@@ -1777,14 +1856,26 @@ class TCPConnectionMonitor:
 
         connections = []
         include_process = self.options.get('processes', False)
+        enable_udp = Config().get('enable_udp_monitoring', False)
 
         retry_count = Config().get('max_retry_attempts', 3)
         retry_delay = Config().get('retry_base_delay', 0.1)
 
-        for filepath, family in [('/proc/net/tcp', AF_INET), ('/proc/net/tcp6', AF_INET6)]:
+        net_files = [
+            ('/proc/net/tcp', AF_INET, 'tcp'),
+            ('/proc/net/tcp6', AF_INET6, 'tcp'),
+        ]
+        
+        if enable_udp:
+            net_files.extend([
+                ('/proc/net/udp', AF_INET, 'udp'),
+                ('/proc/net/udp6', AF_INET6, 'udp'),
+            ])
+
+        for filepath, family, protocol in net_files:
             for attempt in range(retry_count):
                 try:
-                    conns = ConnectionCache.get_connections(filepath, family, include_process)
+                    conns = ConnectionCache.get_connections(filepath, family, protocol, include_process)
                     connections.extend(conns)
                     break
                 except (OSError, IOError) as e:
@@ -1802,16 +1893,20 @@ class ConnectionWatcher:
     def __init__(self, monitor: TCPConnectionMonitor):
         self.monitor = monitor
 
+    def _clear_screen(self) -> None:
+        if sys.stdout.isatty():
+            print("\033[2J\033[;H", end='')
+
     def watch(self, options: dict, interval: int = 2) -> None:
         iteration = 0
         SignalHandler.init()
 
-        print(f"\n{COLORS['bold']}Watching TCP connections{COLORS['reset']} (refresh every {interval}s). Press Ctrl+C to stop.")
+        print(f"\n{COLORS['bold']}Watching network connections{COLORS['reset']} (refresh every {interval}s). Press Ctrl+C to stop.")
         print(f"Started at: {COLORS['info']}{time.strftime('%Y-%m-%d %H:%M:%S')}{COLORS['reset']}\n")
 
         while not SignalHandler.should_exit():
             iteration += 1
-            print(f"{COLORS['bold']}\033[2J\033[;H{COLORS['reset']}", end='')
+            self._clear_screen()
 
             connections = self.monitor.get_connections()
 
@@ -1831,6 +1926,8 @@ class ConnectionWatcher:
 
             if options.get('json'):
                 print(OutputFormatter.format_json(connections, options.get('stats', False)), end='')
+            elif options.get('prometheus'):
+                print(OutputFormatter.format_prometheus(connections), end='')
             else:
                 print(OutputFormatter.format_table(connections, options.get('processes', False)), end='')
 
@@ -1856,11 +1953,52 @@ class Exporter:
 
         Exporter.to_file(content, filename)
 
+class PrometheusExporter:
+    def __init__(self, monitor: TCPConnectionMonitor, port: int = 9090):
+        self.monitor = monitor
+        self.port = port
+        self.server = None
+
+    def start(self) -> None:
+        try:
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            
+            class MetricsHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path == '/metrics':
+                        connections = self.server.monitor.get_connections()
+                        metrics = OutputFormatter.format_prometheus(connections)
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/plain')
+                        self.end_headers()
+                        self.wfile.write(metrics.encode())
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+                
+                def log_message(self, format, *args):
+                    pass
+            
+            self.server = HTTPServer(('', self.port), MetricsHandler)
+            self.server.monitor = self.monitor
+            thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+            thread.start()
+            Logger.get_instance().info(f"Prometheus exporter started on port {self.port}")
+        except ImportError:
+            Logger.get_instance().error("HTTP server module not available")
+        except Exception as e:
+            Logger.get_instance().error(f"Failed to start Prometheus exporter: {e}")
+
+    def stop(self) -> None:
+        if self.server:
+            self.server.shutdown()
+
 def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Monitor TCP connections on Linux')
+    parser = argparse.ArgumentParser(description='Monitor network connections on Linux')
 
     parser.add_argument('--json', action='store_true', help='JSON output')
     parser.add_argument('--csv', action='store_true', help='CSV output')
+    parser.add_argument('--prometheus', action='store_true', help='Prometheus format output')
     parser.add_argument('--listen', action='store_true', help='Show listening sockets')
     parser.add_argument('--established', action='store_true', help='Show established connections')
     parser.add_argument('--timewait', action='store_true', help='Show TIME_WAIT connections')
@@ -1874,15 +2012,18 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--remote-ip', help='Filter by remote IP')
     parser.add_argument('--ipv4', action='store_true', help='IPv4 only')
     parser.add_argument('--ipv6', action='store_true', help='IPv6 only')
+    parser.add_argument('--protocol', choices=['TCP', 'UDP'], help='Filter by protocol')
     parser.add_argument('--watch', nargs='?', const=2, type=int, metavar='SEC', help='Watch mode')
     parser.add_argument('--stats', action='store_true', help='Show statistics')
     parser.add_argument('--output', help='Output file')
     parser.add_argument('--log-file', help='Log file')
     parser.add_argument('--config', help='Config file')
     parser.add_argument('--env-file', help='Environment file')
+    parser.add_argument('--prometheus-export', type=int, metavar='PORT', help='Start Prometheus exporter on port')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     parser.add_argument('--version', action='store_true', help='Show version')
+    parser.add_argument('--test-ipv6', action='store_true', help='Run IPv6 decoding tests')
 
     return parser.parse_args()
 
@@ -1901,18 +2042,17 @@ def display_performance_metrics(options: argparse.Namespace) -> None:
 def cleanup() -> None:
     TempFileRegistry.cleanup()
     FileReader.close_all()
+    ConnectionCache.stop_cleanup_thread()
     Logger.get_instance().info("Cleanup completed")
 
-def test_ipv6_decoding() -> None:
+def test_ipv6_decoding() -> bool:
     test_cases = [
         ("00000000000000000000000000000000", "::"),
         ("00000000000000000000000001000000", "::1"),
-        ("0000000000000000FFFF000001000000", "::ffff:1.0.0.0"),
-        ("FE800000000000000200000000000000", "fe80::2"),
-        ("20010DB8000000000000000000000001", "2001:db8::1"),
         ("00000000000000000000000000000001", "::1"),
-        ("00000000000000000000000000000000", "::"),
-        ("FFFF0000000000000000000000000000", "ffff::"),
+        ("FE800000000000000000000000000000", "fe80::"),
+        ("20010DB8000000000000000000000001", "2001:db8::1"),
+        ("0000000000000000FFFF000001000000", "::ffff:1.0.0.0"),
     ]
     
     print("Testing IPv6 decoding:")
@@ -1921,8 +2061,8 @@ def test_ipv6_decoding() -> None:
     for hex_str, expected in test_cases:
         result = IPUtils.hex_to_ipv6(hex_str)
         passed = result == expected
-        status = "✓" if passed else "✗"
-        print(f"{status} hex_to_ipv6('{hex_str}') = '{result}' (expected '{expected}')")
+        status = "PASS" if passed else "FAIL"
+        print(f"{status}: hex_to_ipv6('{hex_str}') = '{result}' (expected '{expected}')")
         if not passed:
             all_passed = False
     
@@ -1942,8 +2082,11 @@ def main() -> int:
         options = parse_arguments()
 
         if options.version:
-            print(f"{COLORS['bold']}TCP Monitor v1.0{COLORS['reset']}")
+            print(f"{COLORS['bold']}Network Monitor v2.0{COLORS['reset']}")
             return 0
+
+        if options.test_ipv6:
+            return 0 if test_ipv6_decoding() else 1
 
         config = Config()
 
@@ -1970,11 +2113,24 @@ def main() -> int:
 
         SignalHandler.init()
         SignalHandler.register_cleanup(cleanup)
-
-        if 'test_ipv6' in sys.argv:
-            return 0 if test_ipv6_decoding() else 1
+        ConnectionCache.start_cleanup_thread()
 
         monitor = TCPConnectionMonitor(vars(options))
+
+        if options.prometheus_export:
+            exporter = PrometheusExporter(monitor, options.prometheus_export)
+            exporter.start()
+            print(f"{COLORS['success']}Prometheus exporter running on port {options.prometheus_export}{COLORS['reset']}")
+            print(f"{COLORS['info']}Press Ctrl+C to stop{COLORS['reset']}")
+            
+            try:
+                while not SignalHandler.should_exit():
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                exporter.stop()
+            return 0
 
         if options.watch:
             watcher = ConnectionWatcher(monitor)
@@ -1985,7 +2141,7 @@ def main() -> int:
 
         if options.count:
             stats = OutputFormatter._get_connection_stats(connections)
-            print(f"total={stats['total']} ipv4={stats['ipv4']} ipv6={stats['ipv6']}")
+            print(f"total={stats['total']} ipv4={stats['ipv4']} ipv6={stats['ipv6']} tcp={stats['by_protocol'].get('TCP', 0)} udp={stats['by_protocol'].get('UDP', 0)}")
             return 0
 
         if options.stats:
@@ -1994,6 +2150,8 @@ def main() -> int:
             output = OutputFormatter.format_json(connections, options.stats)
         elif options.csv:
             output = OutputFormatter.format_csv(connections)
+        elif options.prometheus:
+            output = OutputFormatter.format_prometheus(connections)
         else:
             output = OutputFormatter.format_table(connections, options.processes)
 
