@@ -17,7 +17,6 @@ import mmap
 import tracemalloc
 import resource
 import socket
-import struct
 from typing import Dict, List, Optional, Tuple, Any, Set, Union
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict, deque
@@ -26,8 +25,6 @@ from enum import Enum
 
 AF_INET = 2
 AF_INET6 = 10
-IPV4_HEX_LENGTH = 8
-IPV6_HEX_LENGTH = 32
 MIN_PORT = 1
 MAX_PORT = 65535
 MIN_INTERVAL = 1
@@ -36,7 +33,6 @@ MIN_CIDR_IPV4 = 0
 MAX_CIDR_IPV4 = 32
 MIN_CIDR_IPV6 = 0
 MAX_CIDR_IPV6 = 128
-PROC_NET_PATHS = ['/proc/net/tcp', '/proc/net/tcp6', '/proc/net/udp', '/proc/net/udp6']
 MAX_PATH_LENGTH = 4096
 MAX_IP_STRING_LENGTH = 256
 
@@ -85,19 +81,29 @@ COLORS = {
 }
 
 @contextmanager
-def timeout(seconds: int):
-    def timeout_handler(signum, frame):
-        raise TimeoutError(f"Operation timed out after {seconds} seconds")
+def file_timeout(seconds: int):
+    deadline = time.time() + seconds
+    yield deadline
 
-    original_handler = None
+def read_with_timeout(filepath: str, timeout_seconds: int = 5) -> Optional[str]:
     try:
-        original_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(seconds)
-        yield
-    finally:
-        signal.alarm(0)
-        if original_handler is not None:
-            signal.signal(signal.SIGALRM, original_handler)
+        with open(filepath, 'r') as f:
+            chunks = []
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            if time.time() >= deadline:
+                raise TimeoutError(f"Timeout reading {filepath}")
+            return ''.join(chunks)
+    except (OSError, IOError, TimeoutError) as e:
+        Logger.get_instance().debug(f"Failed to read {filepath}: {e}")
+        return None
+    except Exception as e:
+        Logger.get_instance().debug(f"Unexpected error reading {filepath}: {e}")
+        return None
 
 class ConfigError(Exception):
     pass
@@ -166,7 +172,7 @@ class Config:
         return cls._instance
 
     def get(self, key: str, default: Any = None) -> Any:
-        env_key = f'TCP_MONITOR_{key.upper()}'
+        env_key = f'NET_MONITOR_{key.upper()}'
         if env_key in os.environ:
             return self._cast_value(os.environ[env_key], key)
         with self._lock:
@@ -236,7 +242,7 @@ class Config:
 
     def load_from_env(self) -> None:
         for key, value in os.environ.items():
-            if key.startswith('TCP_MONITOR_'):
+            if key.startswith('NET_MONITOR_'):
                 config_key = key[12:].lower()
                 self.set(config_key, value)
 
@@ -253,7 +259,7 @@ class Config:
                         key = key.strip()
                         value = value.strip()
 
-                        if key.startswith('TCP_MONITOR_'):
+                        if key.startswith('NET_MONITOR_'):
                             os.environ[key] = value
         except Exception as e:
             raise RuntimeError(f"Failed to load env file: {e}")
@@ -318,8 +324,6 @@ class Logger:
     _instance = None
     _log_file = None
     _log_level = logging.INFO
-    _buffer = []
-    _BUFFER_SIZE = 100
     _file_handler: Optional[RotatingFileHandler] = None
     _lock = threading.RLock()
     _cleanup_done = False
@@ -341,7 +345,7 @@ class Logger:
         return cls._instance
 
     def _setup_logger(self) -> None:
-        self.logger = logging.getLogger('tcp_monitor')
+        self.logger = logging.getLogger('net_monitor')
         self.logger.setLevel(self._log_level)
         self.logger.propagate = False
 
@@ -455,29 +459,6 @@ class Security:
                 return True
 
         return False
-
-    @staticmethod
-    def _normalize_path(path: str) -> str:
-        path = path.strip()
-        if not path:
-            return '/'
-
-        if path[0] != '/':
-            path = '/' + path
-
-        parts = path.split('/')
-        result = []
-
-        for part in parts:
-            if part == '' or part == '.':
-                continue
-            if part == '..':
-                if result and result[-1] != 'proc':
-                    result.pop()
-                continue
-            result.append(part)
-
-        return '/' + '/'.join(result)
 
     @staticmethod
     def validate_proc_filesystem() -> None:
@@ -730,9 +711,10 @@ class ErrorHandler:
 
         timeout_seconds = Config().get('file_operation_timeout', 5)
         try:
-            with timeout(timeout_seconds):
-                with open(filepath, 'r') as f:
-                    return f.read()
+            content = read_with_timeout(filepath, timeout_seconds)
+            if content is None:
+                raise RuntimeError(f"Failed to read {filepath}")
+            return content
         except TimeoutError as e:
             raise RuntimeError(f"Timeout reading {filepath}: {e}")
         except Exception as e:
@@ -804,40 +786,30 @@ class TempFileRegistry:
         cls._max_files = max_files
 
 class FileReader:
-    _handles = {}
-    _lock = threading.RLock()
-    _max_handles = 10
+    @staticmethod
+    def read(path: str, timeout_seconds: int = 5) -> Optional[str]:
+        return read_with_timeout(path, timeout_seconds)
 
-    @classmethod
-    def read(cls, path: str, timeout_seconds: int = 5) -> Optional[str]:
+    @staticmethod
+    def read_mmap(path: str, timeout_seconds: int = 5) -> Optional[str]:
         try:
-            with timeout(timeout_seconds):
-                with open(path, 'r') as f:
-                    return f.read()
-        except TimeoutError:
-            Logger.get_instance().debug(f"Timeout reading {path}")
-            return None
-        except (OSError, IOError) as e:
-            Logger.get_instance().debug(f"Failed to read {path}: {e}")
-            return None
-        except Exception as e:
-            Logger.get_instance().debug(f"Unexpected error reading {path}: {e}")
-            return None
-
-    @classmethod
-    def read_mmap(cls, path: str, timeout_seconds: int = 5) -> Optional[str]:
-        try:
-            with timeout(timeout_seconds):
-                with open(path, 'rb') as f:
-                    file_size = os.fstat(f.fileno()).st_size
-                    if file_size == 0:
-                        return ""
-                    if file_size > Config().get('max_file_size', 10485760):
-                        return None
-                    with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                        if mm.size() != file_size:
-                            raise RuntimeError("File size changed during read")
-                        return mm.read().decode('ascii', errors='ignore')
+            deadline = time.time() + timeout_seconds
+            with open(path, 'rb') as f:
+                if time.time() >= deadline:
+                    raise TimeoutError(f"Timeout mmap reading {path}")
+                file_size = os.fstat(f.fileno()).st_size
+                if file_size == 0:
+                    return ""
+                if file_size > Config().get('max_file_size', 10485760):
+                    return None
+                if time.time() >= deadline:
+                    raise TimeoutError(f"Timeout mmap reading {path}")
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    if mm.size() != file_size:
+                        raise RuntimeError("File size changed during read")
+                    if time.time() >= deadline:
+                        raise TimeoutError(f"Timeout mmap reading {path}")
+                    return mm.read().decode('ascii', errors='ignore')
         except TimeoutError:
             Logger.get_instance().debug(f"Timeout mmap reading {path}")
             return None
@@ -850,8 +822,7 @@ class FileReader:
 
     @classmethod
     def close_all(cls) -> None:
-        with cls._lock:
-            cls._handles.clear()
+        pass
 
 class InputValidator:
     @staticmethod
@@ -931,9 +902,9 @@ class IPUtils:
             return '0.0.0.0'
         
         try:
-            ip_int = int(hex_str, 16)
-            return str(ipaddress.IPv4Address(ip_int))
-        except (ValueError, TypeError):
+            raw = bytes.fromhex(hex_str)
+            return socket.inet_ntoa(raw[::-1])
+        except (ValueError, OSError):
             return '0.0.0.0'
 
     @staticmethod
@@ -1127,27 +1098,24 @@ class ProcessCache:
                     break
 
                 try:
-                    with timeout(timeout_seconds):
-                        status_path = f"/proc/{pid}/status"
-                        if not os.path.exists(status_path):
-                            continue
+                    content = read_with_timeout(f"/proc/{pid}/status", timeout_seconds)
+                    if content is None:
+                        continue
 
-                        with open(status_path, 'r') as f:
-                            header = f.read(512)
-                            if skip_kernel and 'Kthread' in header:
-                                continue
+                    if skip_kernel and 'Kthread' in content:
+                        continue
 
-                            name_match = cls._name_pattern.search(header)
-                            process_name = name_match.group(1).strip() if name_match else f"PID:{pid}"
+                    name_match = cls._name_pattern.search(content)
+                    process_name = name_match.group(1).strip() if name_match else f"PID:{pid}"
 
-                            inodes = cls._get_process_inodes_fast(pid)
+                    inodes = cls._get_process_inodes_fast(pid)
 
-                            if inodes:
-                                for inode in inodes:
-                                    if inode in inode_set:
-                                        process_map[inode] = f"{process_name} (PID:{pid})"
-                                        if len(process_map) >= len(inode_set):
-                                            break
+                    if inodes:
+                        for inode in inodes:
+                            if inode in inode_set:
+                                process_map[inode] = f"{process_name} (PID:{pid})"
+                                if len(process_map) >= len(inode_set):
+                                    break
                 except TimeoutError:
                     continue
                 except (OSError, IOError):
@@ -1178,17 +1146,17 @@ class ProcessCache:
                 continue
 
             try:
-                with timeout(timeout_seconds):
-                    with open(filepath, 'r') as f:
-                        next(f)
-                        for line in f:
-                            match = re.search(r'\s+(\d+)$', line.strip())
-                            if match:
-                                inodes.append(int(match.group(1)))
-                                if len(inodes) >= max_inodes:
-                                    break
-            except (TimeoutError, OSError, IOError):
-                continue
+                content = read_with_timeout(filepath, timeout_seconds)
+                if content is None:
+                    continue
+                    
+                lines = content.split('\n')
+                for line in lines[1:]:
+                    match = re.search(r'\s+(\d+)$', line.strip())
+                    if match:
+                        inodes.append(int(match.group(1)))
+                        if len(inodes) >= max_inodes:
+                            break
             except Exception:
                 continue
 
@@ -1206,24 +1174,21 @@ class ProcessCache:
         timeout_seconds = Config().get('file_operation_timeout', 5)
 
         try:
-            with timeout(timeout_seconds):
+            deadline = time.time() + timeout_seconds
+            fd_count = 0
+            for fd in os.listdir(fd_path):
+                if fd_count >= max_fd_scan:
+                    break
+                if time.time() >= deadline:
+                    break
                 try:
-                    fd_count = 0
-                    for fd in os.listdir(fd_path):
-                        if fd_count >= max_fd_scan:
-                            break
-                        try:
-                            link = os.readlink(os.path.join(fd_path, fd))
-                            match = re.search(r'socket:\[(\d+)\]', link)
-                            if match:
-                                inodes.add(int(match.group(1)))
-                            fd_count += 1
-                        except (OSError, IOError):
-                            pass
-                except OSError:
+                    link = os.readlink(os.path.join(fd_path, fd))
+                    match = re.search(r'socket:\[(\d+)\]', link)
+                    if match:
+                        inodes.add(int(match.group(1)))
+                    fd_count += 1
+                except (OSError, IOError):
                     pass
-        except TimeoutError:
-            pass
         except Exception:
             pass
 
@@ -1302,9 +1267,8 @@ class ConnectionCache:
         cache_ttl = Config().get('connection_cache_ttl', 1)
 
         try:
-            with timeout(timeout_seconds):
-                stat = os.stat(filepath)
-        except (TimeoutError, OSError):
+            stat = os.stat(filepath)
+        except OSError:
             return []
 
         cache_key = (filepath, family, protocol_type, include_process, stat.st_mtime, stat.st_size, stat.st_ino)
@@ -1377,73 +1341,72 @@ class ConnectionCache:
         state_map = TCP_STATES if protocol_type == 'tcp' else UDP_STATES
 
         try:
-            with timeout(timeout_seconds):
-                with open(filepath, 'r') as f:
-                    next(f)
-                    for line in f:
-                        if len(connections) >= max_connections:
-                            break
-                        
-                        line = line.strip()
-                        if not line:
-                            continue
+            content = read_with_timeout(filepath, timeout_seconds)
+            if content is None:
+                return []
+                
+            lines = content.split('\n')
+            for line in lines[1:]:
+                if len(connections) >= max_connections:
+                    break
+                
+                line = line.strip()
+                if not line:
+                    continue
 
-                        fields = re.split(r'\s+', line)
-                        if len(fields) < 10:
-                            continue
+                fields = re.split(r'\s+', line)
+                if len(fields) < 10:
+                    continue
 
-                        try:
-                            local_addr = fields[1]
-                            remote_addr = fields[2]
+                try:
+                    local_addr = fields[1]
+                    remote_addr = fields[2]
 
-                            local_parts = local_addr.split(':')
-                            remote_parts = remote_addr.split(':')
+                    local_parts = local_addr.split(':')
+                    remote_parts = remote_addr.split(':')
 
-                            if len(local_parts) != 2 or len(remote_parts) != 2:
-                                continue
+                    if len(local_parts) != 2 or len(remote_parts) != 2:
+                        continue
 
-                            local_ip_hex = local_parts[0]
-                            local_port_hex = local_parts[1]
-                            remote_ip_hex = remote_parts[0]
-                            remote_port_hex = remote_parts[1]
+                    local_ip_hex = local_parts[0]
+                    local_port_hex = local_parts[1]
+                    remote_ip_hex = remote_parts[0]
+                    remote_port_hex = remote_parts[1]
 
-                            if family == AF_INET:
-                                local_ip = IPUtils.hex_to_ipv4(local_ip_hex)
-                                remote_ip = IPUtils.hex_to_ipv4(remote_ip_hex)
-                            else:
-                                local_ip = IPUtils.hex_to_ipv6(local_ip_hex)
-                                remote_ip = IPUtils.hex_to_ipv6(remote_ip_hex)
+                    if family == AF_INET:
+                        local_ip = IPUtils.hex_to_ipv4(local_ip_hex)
+                        remote_ip = IPUtils.hex_to_ipv4(remote_ip_hex)
+                    else:
+                        local_ip = IPUtils.hex_to_ipv6(local_ip_hex)
+                        remote_ip = IPUtils.hex_to_ipv6(remote_ip_hex)
 
-                            local_port = int(local_port_hex, 16)
-                            remote_port = int(remote_port_hex, 16)
-                            state_code = fields[3].upper()
-                            state = state_map.get(state_code, f"UNKNOWN-{state_code}")
-                            proto = 'IPv4' if family == AF_INET else 'IPv6'
-                            inode = fields[9]
+                    local_port = int(local_port_hex, 16)
+                    remote_port = int(remote_port_hex, 16)
+                    state_code = fields[3].upper()
+                    state = state_map.get(state_code, f"UNKNOWN-{state_code}")
+                    proto = 'IPv4' if family == AF_INET else 'IPv6'
+                    inode = fields[9]
 
-                            process = ''
-                            if include_process and inode.isdigit():
-                                inode_int = int(inode)
-                                if inode_int in process_map:
-                                    process = process_map[inode_int]
+                    process = ''
+                    if include_process and inode.isdigit():
+                        inode_int = int(inode)
+                        if inode_int in process_map:
+                            process = process_map[inode_int]
 
-                            connection = Connection(
-                                proto=proto,
-                                protocol_type=protocol_type.upper(),
-                                state=state,
-                                local_ip=local_ip,
-                                local_port=local_port,
-                                remote_ip=remote_ip,
-                                remote_port=remote_port,
-                                inode=inode,
-                                process=process
-                            )
-                            connections.append(connection)
-                        except (ValueError, IndexError) as e:
-                            continue
-        except TimeoutError:
-            Logger.get_instance().debug(f"Timeout reading {filepath}")
-            return []
+                    connection = Connection(
+                        proto=proto,
+                        protocol_type=protocol_type.upper(),
+                        state=state,
+                        local_ip=local_ip,
+                        local_port=local_port,
+                        remote_ip=remote_ip,
+                        remote_port=remote_port,
+                        inode=inode,
+                        process=process
+                    )
+                    connections.append(connection)
+                except (ValueError, IndexError):
+                    continue
         except Exception as e:
             Logger.get_instance().debug(f"Error reading {filepath}: {e}")
             return []
@@ -1469,11 +1432,16 @@ class ConnectionCache:
 
 class OutputFormatter:
     @staticmethod
+    def _should_use_colors() -> bool:
+        return Config().get('colors_enabled', True) and sys.stdout.isatty()
+
+    @staticmethod
     def format_table(
         connections: List[Connection],
-        show_process: bool = False,
-        use_colors: bool = True
+        show_process: bool = False
     ) -> str:
+        use_colors = OutputFormatter._should_use_colors()
+        
         if not connections:
             return OutputFormatter._colorize("No connections found.\n", 'info', use_colors)
 
@@ -1595,7 +1563,8 @@ class OutputFormatter:
         return "\n".join(lines)
 
     @staticmethod
-    def format_statistics(connections: List[Connection], use_colors: bool = True) -> str:
+    def format_statistics(connections: List[Connection]) -> str:
+        use_colors = OutputFormatter._should_use_colors()
         stats = OutputFormatter._get_connection_stats(connections)
 
         lines = []
@@ -1830,6 +1799,8 @@ class SignalHandler:
 
     @classmethod
     def _cleanup(cls) -> None:
+        if cls._cleanup_done:
+            return
         with cls._lock:
             if cls._cleanup_done:
                 return
@@ -1840,7 +1811,7 @@ class SignalHandler:
                     pass
             cls._cleanup_done = True
 
-class TCPConnectionMonitor:
+class NetworkMonitor:
     def __init__(self, options: dict):
         self.options = options
         self._last_scan = 0
@@ -1890,7 +1861,7 @@ class TCPConnectionMonitor:
         return ConnectionFilter.filter(connections, self.options)
 
 class ConnectionWatcher:
-    def __init__(self, monitor: TCPConnectionMonitor):
+    def __init__(self, monitor: NetworkMonitor):
         self.monitor = monitor
 
     def _clear_screen(self) -> None:
@@ -1900,9 +1871,10 @@ class ConnectionWatcher:
     def watch(self, options: dict, interval: int = 2) -> None:
         iteration = 0
         SignalHandler.init()
+        use_colors = OutputFormatter._should_use_colors()
 
-        print(f"\n{COLORS['bold']}Watching network connections{COLORS['reset']} (refresh every {interval}s). Press Ctrl+C to stop.")
-        print(f"Started at: {COLORS['info']}{time.strftime('%Y-%m-%d %H:%M:%S')}{COLORS['reset']}\n")
+        print(f"\n{COLORS['bold'] if use_colors else ''}Watching network connections{COLORS['reset'] if use_colors else ''} (refresh every {interval}s). Press Ctrl+C to stop.")
+        print(f"Started at: {COLORS['info'] if use_colors else ''}{time.strftime('%Y-%m-%d %H:%M:%S')}{COLORS['reset'] if use_colors else ''}\n")
 
         while not SignalHandler.should_exit():
             iteration += 1
@@ -1917,12 +1889,12 @@ class ConnectionWatcher:
                 removed = len(changes['removed'])
                 if added or removed:
                     change_color = 'success' if added > removed else 'warning'
-                    print(f"{COLORS[change_color]}Changes: +{added} -{removed}{COLORS['reset']}")
+                    print(f"{COLORS[change_color] if use_colors else ''}Changes: +{added} -{removed}{COLORS['reset'] if use_colors else ''}")
                 else:
-                    print(f"{COLORS['info']}No changes{COLORS['reset']}")
+                    print(f"{COLORS['info'] if use_colors else ''}No changes{COLORS['reset'] if use_colors else ''}")
 
-            print(f"{COLORS['header']}[{time.strftime('%H:%M:%S')}] Iteration: {iteration} | Connections: {len(connections)}{COLORS['reset']}")
-            print(f"{COLORS['info']}{'-' * 60}{COLORS['reset']}")
+            print(f"{COLORS['header'] if use_colors else ''}[{time.strftime('%H:%M:%S')}] Iteration: {iteration} | Connections: {len(connections)}{COLORS['reset'] if use_colors else ''}")
+            print(f"{COLORS['info'] if use_colors else ''}{'-' * 60}{COLORS['reset'] if use_colors else ''}")
 
             if options.get('json'):
                 print(OutputFormatter.format_json(connections, options.get('stats', False)), end='')
@@ -1954,7 +1926,7 @@ class Exporter:
         Exporter.to_file(content, filename)
 
 class PrometheusExporter:
-    def __init__(self, monitor: TCPConnectionMonitor, port: int = 9090):
+    def __init__(self, monitor: NetworkMonitor, port: int = 9090):
         self.monitor = monitor
         self.port = port
         self.server = None
@@ -2014,7 +1986,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--ipv6', action='store_true', help='IPv6 only')
     parser.add_argument('--protocol', choices=['TCP', 'UDP'], help='Filter by protocol')
     parser.add_argument('--watch', nargs='?', const=2, type=int, metavar='SEC', help='Watch mode')
-    parser.add_argument('--stats', action='store_true', help='Show statistics')
+    parser.add_argument('--stats', action='store_true', help='Include statistics in output (for JSON format)')
     parser.add_argument('--output', help='Output file')
     parser.add_argument('--log-file', help='Log file')
     parser.add_argument('--config', help='Config file')
@@ -2032,24 +2004,23 @@ def display_performance_metrics(options: argparse.Namespace) -> None:
         metrics = PerformanceTracker.get_metrics()
         process_stats = ProcessCache.get_stats()
         connection_stats = ConnectionCache.get_stats()
+        use_colors = OutputFormatter._should_use_colors()
 
-        print(f"\n{COLORS['bold']}Performance:{COLORS['reset']}")
-        print(f"  Time: {COLORS['info']}{metrics['execution_time']}s{COLORS['reset']}")
-        print(f"  Memory: {COLORS['info']}{metrics['memory_peak_mb']} MB{COLORS['reset']}")
-        print(f"  Process cache: {COLORS['info']}{process_stats['cache_size']}{COLORS['reset']} entries, {COLORS['success']}{process_stats['hit_rate']}%{COLORS['reset']} hits")
-        print(f"  Connection cache: {COLORS['info']}{connection_stats['cache_entries']}{COLORS['reset']} entries, {COLORS['success']}{connection_stats['hit_rate']}%{COLORS['reset']} hits")
+        print(f"\n{COLORS['bold'] if use_colors else ''}Performance:{COLORS['reset'] if use_colors else ''}")
+        print(f"  Time: {COLORS['info'] if use_colors else ''}{metrics['execution_time']}s{COLORS['reset'] if use_colors else ''}")
+        print(f"  Memory: {COLORS['info'] if use_colors else ''}{metrics['memory_peak_mb']} MB{COLORS['reset'] if use_colors else ''}")
+        print(f"  Process cache: {COLORS['info'] if use_colors else ''}{process_stats['cache_size']}{COLORS['reset'] if use_colors else ''} entries, {COLORS['success'] if use_colors else ''}{process_stats['hit_rate']}%{COLORS['reset'] if use_colors else ''} hits")
+        print(f"  Connection cache: {COLORS['info'] if use_colors else ''}{connection_stats['cache_entries']}{COLORS['reset'] if use_colors else ''} entries, {COLORS['success'] if use_colors else ''}{connection_stats['hit_rate']}%{COLORS['reset'] if use_colors else ''} hits")
 
 def cleanup() -> None:
     TempFileRegistry.cleanup()
     FileReader.close_all()
     ConnectionCache.stop_cleanup_thread()
-    Logger.get_instance().info("Cleanup completed")
 
 def test_ipv6_decoding() -> bool:
     test_cases = [
         ("00000000000000000000000000000000", "::"),
         ("00000000000000000000000001000000", "::1"),
-        ("00000000000000000000000000000001", "::1"),
         ("FE800000000000000000000000000000", "fe80::"),
         ("20010DB8000000000000000000000001", "2001:db8::1"),
         ("0000000000000000FFFF000001000000", "::ffff:1.0.0.0"),
@@ -2070,6 +2041,29 @@ def test_ipv6_decoding() -> bool:
     print(f"Overall: {'PASSED' if all_passed else 'FAILED'}")
     return all_passed
 
+def test_ipv4_decoding() -> bool:
+    test_cases = [
+        ("0100007F", "127.0.0.1"),
+        ("00000000", "0.0.0.0"),
+        ("FFFFFFFF", "255.255.255.255"),
+        ("1100A8C0", "192.168.0.17"),
+    ]
+    
+    print("Testing IPv4 decoding:")
+    print("-" * 50)
+    all_passed = True
+    for hex_str, expected in test_cases:
+        result = IPUtils.hex_to_ipv4(hex_str)
+        passed = result == expected
+        status = "PASS" if passed else "FAIL"
+        print(f"{status}: hex_to_ipv4('{hex_str}') = '{result}' (expected '{expected}')")
+        if not passed:
+            all_passed = False
+    
+    print("-" * 50)
+    print(f"Overall: {'PASSED' if all_passed else 'FAILED'}")
+    return all_passed
+
 def main() -> int:
     try:
         PerformanceTracker.start()
@@ -2082,7 +2076,7 @@ def main() -> int:
         options = parse_arguments()
 
         if options.version:
-            print(f"{COLORS['bold']}Network Monitor v2.0{COLORS['reset']}")
+            print("Network Monitor v2.0")
             return 0
 
         if options.test_ipv6:
@@ -2115,13 +2109,13 @@ def main() -> int:
         SignalHandler.register_cleanup(cleanup)
         ConnectionCache.start_cleanup_thread()
 
-        monitor = TCPConnectionMonitor(vars(options))
+        monitor = NetworkMonitor(vars(options))
 
         if options.prometheus_export:
             exporter = PrometheusExporter(monitor, options.prometheus_export)
             exporter.start()
-            print(f"{COLORS['success']}Prometheus exporter running on port {options.prometheus_export}{COLORS['reset']}")
-            print(f"{COLORS['info']}Press Ctrl+C to stop{COLORS['reset']}")
+            print(f"Prometheus exporter running on port {options.prometheus_export}")
+            print("Press Ctrl+C to stop")
             
             try:
                 while not SignalHandler.should_exit():
@@ -2144,22 +2138,23 @@ def main() -> int:
             print(f"total={stats['total']} ipv4={stats['ipv4']} ipv6={stats['ipv6']} tcp={stats['by_protocol'].get('TCP', 0)} udp={stats['by_protocol'].get('UDP', 0)}")
             return 0
 
-        if options.stats:
-            output = OutputFormatter.format_statistics(connections)
-        elif options.json:
+        if options.json:
             output = OutputFormatter.format_json(connections, options.stats)
         elif options.csv:
             output = OutputFormatter.format_csv(connections)
         elif options.prometheus:
             output = OutputFormatter.format_prometheus(connections)
         else:
-            output = OutputFormatter.format_table(connections, options.processes)
+            if options.stats:
+                output = OutputFormatter.format_statistics(connections)
+            else:
+                output = OutputFormatter.format_table(connections, options.processes)
 
         if options.output:
             if options.csv or not options.json:
                 output = OutputFormatter.strip_colors(output)
             Exporter.to_file_with_backup(output, options.output)
-            print(f"{COLORS['success']}Output written to: {options.output}{COLORS['reset']}")
+            print(f"Output written to: {options.output}")
         else:
             print(output, end='')
 
