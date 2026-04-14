@@ -10,7 +10,6 @@ import argparse
 import tempfile
 import threading
 import logging
-import csv
 import re
 import atexit
 import mmap
@@ -21,7 +20,6 @@ from typing import Dict, List, Optional, Tuple, Any, Set, Union
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict, deque
 from contextlib import contextmanager
-from enum import Enum
 
 AF_INET = 2
 AF_INET6 = 10
@@ -35,10 +33,6 @@ MIN_CIDR_IPV6 = 0
 MAX_CIDR_IPV6 = 128
 MAX_PATH_LENGTH = 4096
 MAX_IP_STRING_LENGTH = 256
-
-class ProtocolType(Enum):
-    TCP = "TCP"
-    UDP = "UDP"
 
 TCP_STATES = {
     '01': "ESTABLISHED",
@@ -79,11 +73,6 @@ COLORS = {
     'warning': '\033[93m',
     'error': '\033[91m',
 }
-
-@contextmanager
-def file_timeout(seconds: int):
-    deadline = time.time() + seconds
-    yield deadline
 
 def read_with_timeout(filepath: str, timeout_seconds: int = 5) -> Optional[str]:
     try:
@@ -960,7 +949,6 @@ class CacheEntry:
     data: Any
     timestamp: float
     ttl: int = 300
-    checksum: str = ''
 
 class ProcessCache:
     _cache: Dict[int, str] = {}
@@ -972,27 +960,53 @@ class ProcessCache:
     _last_scan = 0
     _lock = threading.RLock()
     _build_condition = threading.Condition(_lock)
-    _max_cache_size = Config().get('max_cache_entries', 10000)
     _name_pattern = re.compile(r'Name:\s*(.+)')
+
+    @classmethod
+    def _get_max_cache_entries(cls) -> int:
+        return Config().get('max_cache_entries', 10000)
+
+    @classmethod
+    def _get_max_cache_age(cls) -> int:
+        return Config().get('max_cache_age', 300)
+
+    @classmethod
+    def _get_cache_ttl(cls) -> int:
+        return Config().get('process_cache_ttl', 5)
 
     @classmethod
     def _cleanup_old_entries(cls):
         now = time.time()
-        max_age = Config().get('max_cache_age', 300)
-        with cls._lock:
-            to_delete = [k for k, v in cls._cache_timestamp.items() 
-                        if now - v > max_age]
-            for k in to_delete:
-                cls._cache.pop(k, None)
-                cls._cache_timestamp.pop(k, None)
+        max_age = cls._get_max_cache_age()
+        to_delete = []
+        for k, v in cls._cache_timestamp.items():
+            if now - v > max_age:
+                to_delete.append(k)
+        for k in to_delete:
+            cls._cache.pop(k, None)
+            cls._cache_timestamp.pop(k, None)
+
+    @classmethod
+    def _enforce_size_limit(cls):
+        max_entries = cls._get_max_cache_entries()
+        if len(cls._cache) > max_entries:
+            keep_count = max(1, int(max_entries * 0.9))
+            sorted_items = sorted(
+                cls._cache_timestamp.items(),
+                key=lambda x: x[1]
+            )
+            for pid, _ in sorted_items[:-keep_count]:
+                cls._cache.pop(pid, None)
+                cls._cache_timestamp.pop(pid, None)
 
     @classmethod
     def get_process_map(cls) -> Dict[int, str]:
         now = time.time()
-        ttl = Config().get('process_cache_ttl', 5)
+        ttl = cls._get_cache_ttl()
 
         with cls._lock:
             cls._cleanup_old_entries()
+            cls._enforce_size_limit()
 
             if cls._cache and (now - cls._last_build) <= ttl and not cls._building:
                 cls._hits += 1
@@ -1023,27 +1037,25 @@ class ProcessCache:
             cls._misses += 1
             cls._building = True
 
-            try:
-                new_cache = cls._build_process_map_fast()
+        try:
+            new_cache = cls._build_process_map_fast()
+            
+            with cls._lock:
                 if new_cache or not cls._cache:
                     cls._cache = new_cache
                     cls._last_build = now
                     cls._last_scan = now
-                    for pid in new_cache:
-                        cls._cache_timestamp[pid] = now
+                    for inode_int in new_cache:
+                        cls._cache_timestamp[inode_int] = now
 
-                if len(cls._cache) > cls._max_cache_size:
-                    sorted_cache = sorted(
-                        cls._cache.items(),
-                        key=lambda x: cls._cache_timestamp.get(x[0], 0)
-                    )
-                    cls._cache = dict(sorted_cache[-cls._max_cache_size:])
-
+                cls._enforce_size_limit()
                 return cls._cache.copy()
-            except Exception as e:
-                Logger.get_instance().error(f"Failed to build process cache: {e}")
+        except Exception as e:
+            Logger.get_instance().error(f"Failed to build process cache: {e}")
+            with cls._lock:
                 return cls._cache.copy() if cls._cache else {}
-            finally:
+        finally:
+            with cls._lock:
                 cls._building = False
                 cls._build_condition.notify_all()
 
@@ -1211,14 +1223,16 @@ class ProcessCache:
 
     @classmethod
     def get_stats(cls) -> dict:
-        total = cls._hits + cls._misses
-        return {
-            'cache_size': len(cls._cache),
-            'hits': cls._hits,
-            'misses': cls._misses,
-            'hit_rate': round(cls._hits / total * 100, 2) if total > 0 else 0,
-            'building': cls._building
-        }
+        with cls._lock:
+            total = cls._hits + cls._misses
+            return {
+                'cache_size': len(cls._cache),
+                'hits': cls._hits,
+                'misses': cls._misses,
+                'hit_rate': round(cls._hits / total * 100, 2) if total > 0 else 0,
+                'building': cls._building,
+                'max_size': cls._get_max_cache_entries()
+            }
 
 class ConnectionCache:
     _cache: Dict[tuple, CacheEntry] = {}
@@ -1229,9 +1243,17 @@ class ConnectionCache:
     _stop_cleanup = False
 
     @classmethod
+    def _get_max_entries(cls) -> int:
+        return Config().get('max_cache_entries', 10000)
+
+    @classmethod
+    def _get_cache_ttl(cls) -> int:
+        return Config().get('connection_cache_ttl', 1)
+
+    @classmethod
     def _cleanup_worker(cls):
         while not cls._stop_cleanup:
-            time.sleep(60)
+            time.sleep(30)
             with cls._lock:
                 now = time.time()
                 to_delete = []
@@ -1240,6 +1262,17 @@ class ConnectionCache:
                         to_delete.append(key)
                 for key in to_delete:
                     del cls._cache[key]
+                
+                max_entries = cls._get_max_entries()
+                if len(cls._cache) > max_entries:
+                    keep_count = max(1, int(max_entries * 0.8))
+                    sorted_entries = sorted(
+                        cls._cache.items(),
+                        key=lambda x: x[1].timestamp
+                    )
+                    for key, _ in sorted_entries[:-keep_count]:
+                        if key in cls._cache:
+                            del cls._cache[key]
 
     @classmethod
     def start_cleanup_thread(cls):
@@ -1253,6 +1286,7 @@ class ConnectionCache:
         cls._stop_cleanup = True
         if cls._cleanup_thread:
             cls._cleanup_thread.join(timeout=5)
+            cls._cleanup_thread = None
 
     @classmethod
     def get_connections(
@@ -1264,7 +1298,7 @@ class ConnectionCache:
     ) -> List[Connection]:
         max_connections = Config().get('max_connections_per_scan', 50000)
         timeout_seconds = Config().get('file_operation_timeout', 5)
-        cache_ttl = Config().get('connection_cache_ttl', 1)
+        cache_ttl = cls._get_cache_ttl()
 
         try:
             stat = os.stat(filepath)
@@ -1279,48 +1313,43 @@ class ConnectionCache:
             if cache_key in cls._cache:
                 entry = cls._cache[cache_key]
                 if now - entry.timestamp < cache_ttl:
-                    if cls._validate_cache_entry(entry):
-                        cls._hits += 1
-                        return entry.data.copy()
-                    else:
-                        del cls._cache[cache_key]
+                    cls._hits += 1
+                    return [cls._copy_connection(c) for c in entry.data]
 
             cls._misses += 1
 
-            with PerformanceTracker.timer(f"read_{os.path.basename(filepath)}"):
-                connections = cls._read_connections_stream(filepath, family, protocol_type, include_process, max_connections)
+        with PerformanceTracker.timer(f"read_{os.path.basename(filepath)}"):
+            connections = cls._read_connections_stream(
+                filepath, family, protocol_type, include_process, max_connections
+            )
 
-                if len(connections) > max_connections:
-                    connections = connections[:max_connections]
+            if len(connections) > max_connections:
+                connections = connections[:max_connections]
 
-                checksum = cls._calculate_checksum(connections)
-                cls._cache[cache_key] = CacheEntry(connections, now, cache_ttl, checksum)
+        with cls._lock:
+            cls._cache[cache_key] = CacheEntry(connections, now, cache_ttl)
+            
+            max_entries = cls._get_max_entries()
+            if len(cls._cache) > max_entries:
+                oldest = min(cls._cache.keys(), key=lambda k: cls._cache[k].timestamp)
+                del cls._cache[oldest]
 
-                max_cache_entries = Config().get('max_cache_entries', 10000)
-                if len(cls._cache) > max_cache_entries:
-                    oldest = min(cls._cache.keys(), key=lambda k: cls._cache[k].timestamp)
-                    del cls._cache[oldest]
-
-            return connections.copy()
-
-    @classmethod
-    def _validate_cache_entry(cls, entry: CacheEntry) -> bool:
-        if not hasattr(entry, 'data') or not hasattr(entry, 'timestamp'):
-            return False
-        if not isinstance(entry.data, list):
-            return False
-        if entry.data and not isinstance(entry.data[0], Connection):
-            return False
-        current_checksum = cls._calculate_checksum(entry.data)
-        return current_checksum == entry.checksum
+        return connections
 
     @classmethod
-    def _calculate_checksum(cls, connections: List[Connection]) -> str:
-        if not connections:
-            return ''
-        sample = connections[:10]
-        data = ''.join(c.key() for c in sample)
-        return str(hash(data) & 0xffffffff)
+    def _copy_connection(cls, conn: Connection) -> Connection:
+        return Connection(
+            proto=conn.proto,
+            protocol_type=conn.protocol_type,
+            state=conn.state,
+            local_ip=conn.local_ip,
+            local_port=conn.local_port,
+            remote_ip=conn.remote_ip,
+            remote_port=conn.remote_port,
+            inode=conn.inode,
+            process=conn.process,
+            timestamp=conn.timestamp
+        )
 
     @classmethod
     def _read_connections_stream(
@@ -1422,13 +1451,15 @@ class ConnectionCache:
 
     @classmethod
     def get_stats(cls) -> dict:
-        total = cls._hits + cls._misses
-        return {
-            'cache_entries': len(cls._cache),
-            'hits': cls._hits,
-            'misses': cls._misses,
-            'hit_rate': round(cls._hits / total * 100, 2) if total > 0 else 0
-        }
+        with cls._lock:
+            total = cls._hits + cls._misses
+            return {
+                'cache_entries': len(cls._cache),
+                'hits': cls._hits,
+                'misses': cls._misses,
+                'hit_rate': round(cls._hits / total * 100, 2) if total > 0 else 0,
+                'max_entries': cls._get_max_entries()
+            }
 
 class OutputFormatter:
     @staticmethod
@@ -1995,6 +2026,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     parser.add_argument('--version', action='store_true', help='Show version')
+    parser.add_argument('--test-ipv4', action='store_true', help='Run IPv4 decoding tests')
     parser.add_argument('--test-ipv6', action='store_true', help='Run IPv6 decoding tests')
 
     return parser.parse_args()
@@ -2016,6 +2048,29 @@ def cleanup() -> None:
     TempFileRegistry.cleanup()
     FileReader.close_all()
     ConnectionCache.stop_cleanup_thread()
+
+def test_ipv4_decoding() -> bool:
+    test_cases = [
+        ("0100007F", "127.0.0.1"),
+        ("00000000", "0.0.0.0"),
+        ("FFFFFFFF", "255.255.255.255"),
+        ("1100A8C0", "192.168.0.17"),
+    ]
+    
+    print("Testing IPv4 decoding:")
+    print("-" * 50)
+    all_passed = True
+    for hex_str, expected in test_cases:
+        result = IPUtils.hex_to_ipv4(hex_str)
+        passed = result == expected
+        status = "PASS" if passed else "FAIL"
+        print(f"{status}: hex_to_ipv4('{hex_str}') = '{result}' (expected '{expected}')")
+        if not passed:
+            all_passed = False
+    
+    print("-" * 50)
+    print(f"Overall: {'PASSED' if all_passed else 'FAILED'}")
+    return all_passed
 
 def test_ipv6_decoding() -> bool:
     test_cases = [
@@ -2041,29 +2096,6 @@ def test_ipv6_decoding() -> bool:
     print(f"Overall: {'PASSED' if all_passed else 'FAILED'}")
     return all_passed
 
-def test_ipv4_decoding() -> bool:
-    test_cases = [
-        ("0100007F", "127.0.0.1"),
-        ("00000000", "0.0.0.0"),
-        ("FFFFFFFF", "255.255.255.255"),
-        ("1100A8C0", "192.168.0.17"),
-    ]
-    
-    print("Testing IPv4 decoding:")
-    print("-" * 50)
-    all_passed = True
-    for hex_str, expected in test_cases:
-        result = IPUtils.hex_to_ipv4(hex_str)
-        passed = result == expected
-        status = "PASS" if passed else "FAIL"
-        print(f"{status}: hex_to_ipv4('{hex_str}') = '{result}' (expected '{expected}')")
-        if not passed:
-            all_passed = False
-    
-    print("-" * 50)
-    print(f"Overall: {'PASSED' if all_passed else 'FAILED'}")
-    return all_passed
-
 def main() -> int:
     try:
         PerformanceTracker.start()
@@ -2078,6 +2110,9 @@ def main() -> int:
         if options.version:
             print("Network Monitor v2.0")
             return 0
+
+        if options.test_ipv4:
+            return 0 if test_ipv4_decoding() else 1
 
         if options.test_ipv6:
             return 0 if test_ipv6_decoding() else 1
